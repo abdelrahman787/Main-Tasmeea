@@ -409,7 +409,7 @@ app.get('/*', (c) => {
       // ==========================================
       const state = {
         // App state
-        currentView: 'home', // home, mushaf, session, analytics, settings
+        currentView: 'home', // home, mushaf, session, analytics, settings, session-detail
         darkMode: localStorage.getItem('darkMode') === 'true',
         showOnboarding: !localStorage.getItem('onboardingDone'),
         
@@ -439,6 +439,9 @@ app.get('/*', (c) => {
         lastSpeechTime: null,
         silenceTimer: null,
         asrFailCount: 0,
+        _isRestarting: false,
+        _lastInterim: '',
+        _pendingRender: null,
         
         // Settings
         difficulty: localStorage.getItem('difficulty') || 'normal',
@@ -452,6 +455,9 @@ app.get('/*', (c) => {
         
         // Session history (client-side)
         sessionHistory: JSON.parse(localStorage.getItem('sessionHistory') || '[]'),
+        
+        // Selected session for detail view
+        selectedSession: null,
         
         // Toast messages
         toasts: [],
@@ -667,19 +673,43 @@ app.get('/*', (c) => {
             this.handleResult(event)
           }
           
+          state.recognition.onaudiostart = () => {
+            state.isListening = true
+            state._isRestarting = false
+            softRender()
+          }
+          
           state.recognition.onerror = (event) => {
             this.handleError(event)
           }
           
           state.recognition.onend = () => {
-            // Auto-restart if session is active
+            // Auto-restart if session is active and not paused
             if (state.sessionActive && !state.sessionPaused) {
-              try {
-                state.recognition.start()
-              } catch(e) {}
+              state._isRestarting = true
+              // Use a small delay to let the browser clean up
+              setTimeout(() => {
+                if (state.sessionActive && !state.sessionPaused) {
+                  try {
+                    state.recognition.start()
+                  } catch(e) {
+                    // If start fails, re-init and retry
+                    setTimeout(() => {
+                      if (state.sessionActive && !state.sessionPaused) {
+                        try { state.recognition.start() } catch(e2) {
+                          state.isListening = false
+                          state._isRestarting = false
+                          softRender()
+                        }
+                      }
+                    }, 500)
+                  }
+                }
+              }, 150)
             } else {
               state.isListening = false
-              render()
+              state._isRestarting = false
+              softRender()
             }
           }
           
@@ -695,26 +725,29 @@ app.get('/*', (c) => {
             state.isListening = true
             state.lastSpeechTime = Date.now()
             state.asrFailCount = 0
+            state._lastInterim = ''
             this.startSilenceMonitor()
             render()
           } catch(e) {
-            // Already started, restart
-            state.recognition.stop()
+            // Already started, abort then restart
+            try { state.recognition.abort() } catch(e2) {}
             setTimeout(() => {
               try {
                 state.recognition.start()
                 state.isListening = true
-                render()
+                softRender()
               } catch(e2) {}
-            }, 200)
+            }, 300)
           }
         },
 
         stop() {
+          state._isRestarting = false
           if (state.recognition) {
-            try { state.recognition.stop() } catch(e) {}
+            try { state.recognition.abort() } catch(e) {}
           }
           state.isListening = false
+          state._lastInterim = ''
           this.stopSilenceMonitor()
           render()
         },
@@ -728,7 +761,6 @@ app.get('/*', (c) => {
           
           for (let i = event.resultIndex; i < event.results.length; i++) {
             const transcript = event.results[i][0].transcript
-            const confidence = event.results[i][0].confidence
             
             if (event.results[i].isFinal) {
               finalTranscript += transcript
@@ -739,12 +771,46 @@ app.get('/*', (c) => {
           
           // Process final transcript
           if (finalTranscript.trim()) {
+            state._lastInterim = ''
             this.processTranscript(finalTranscript.trim())
           }
           
-          // Show interim transcript in UI
-          if (interimTranscript.trim()) {
+          // Also try to match interim results for faster response
+          if (interimTranscript.trim() && interimTranscript !== state._lastInterim) {
+            state._lastInterim = interimTranscript
+            this.processInterim(interimTranscript.trim())
             updateInterimDisplay(interimTranscript.trim())
+          }
+        },
+
+        // Process interim results - match only if confident
+        processInterim(transcript) {
+          if (!state.sessionActive || state.sessionPaused || !state.pageData) return
+          
+          const words = state.pageData.words
+          if (state.currentWordIndex >= words.length) return
+          
+          const spokenTokens = transcript.split(/\\s+/).filter(t => t.length > 0)
+          if (spokenTokens.length === 0) return
+          
+          // Only try to match complete words from interim (not the last token which may be partial)
+          const completeTokens = spokenTokens.length > 1 ? spokenTokens.slice(0, -1) : []
+          if (completeTokens.length === 0) return
+          
+          const results = WordMatcher.matchSequence(
+            completeTokens,
+            words,
+            state.currentWordIndex,
+            state.difficulty
+          )
+          
+          for (const result of results) {
+            if (result.matchType !== 'error') {
+              revealWord(result.wordIndex)
+              state.lastSpeechTime = Date.now()
+            } else {
+              break
+            }
           }
         },
 
@@ -785,7 +851,7 @@ app.get('/*', (c) => {
               // Error - record attempt
               recordAttempt(result.wordIndex, result.spoken, result.errorType)
               
-              // Visual feedback
+              // Visual feedback - use direct DOM manipulation
               flashError(result.wordIndex)
               
               // Haptic feedback
@@ -806,6 +872,10 @@ app.get('/*', (c) => {
             return
           }
           if (event.error === 'aborted') return
+          if (event.error === 'network') {
+            showToast('خطأ في الشبكة - تحقق من الاتصال', 'error')
+            return
+          }
           
           state.asrFailCount++
           if (state.asrFailCount >= 3) {
@@ -830,8 +900,9 @@ app.get('/*', (c) => {
               }
             }
             
-            render() // Update silence indicator
-          }, 1000)
+            // Use soft render to update UI without destroying DOM
+            softRender()
+          }, 2000)
         },
 
         stopSilenceMonitor() {
@@ -936,13 +1007,50 @@ app.get('/*', (c) => {
           state.currentWordIndex++
         }
         
+        // Use targeted DOM update - don't rebuild entire page
+        revealWordInDOM(index)
+        updateControlsInDOM()
+        
         // Check if page is complete
         if (state.currentWordIndex >= state.pageData.words.length) {
           showToast('أحسنت! اكتملت الصفحة', 'success')
           setTimeout(() => endSession(), 1500)
         }
-        
-        render()
+      }
+
+      // Targeted DOM update for revealing a word - doesn't destroy/recreate elements
+      function revealWordInDOM(index) {
+        const el = document.querySelector('[data-word-index="' + index + '"]')
+        if (el) {
+          const span = el.querySelector('span')
+          if (span) {
+            span.classList.remove('word-hidden')
+            span.classList.add('word-revealed')
+          }
+          el.classList.remove('current-word')
+        }
+        // Highlight new current word
+        const nextEl = document.querySelector('[data-word-index="' + state.currentWordIndex + '"]')
+        if (nextEl) {
+          nextEl.classList.add('current-word')
+        }
+      }
+
+      // Update only the bottom controls area without touching the Quran text
+      function updateControlsInDOM() {
+        const controlsEl = document.getElementById('session-controls')
+        if (controlsEl) {
+          controlsEl.innerHTML = renderBottomControlsInner()
+        }
+      }
+
+      // Soft render: updates only dynamic parts during active session
+      function softRender() {
+        if (state.sessionActive && state.currentView === 'mushaf') {
+          updateControlsInDOM()
+        } else {
+          render()
+        }
       }
 
       function recordAttempt(wordIndex, spokenText, errorType) {
@@ -1084,6 +1192,7 @@ app.get('/*', (c) => {
         }
         
         state.lastSpeechTime = Date.now()
+        // Full render needed since multiple words changed
         render()
       }
 
@@ -1135,11 +1244,26 @@ app.get('/*', (c) => {
       function showToast(message, type = 'info') {
         const id = Date.now()
         state.toasts.push({ id, message, type })
-        render()
+        // Use direct DOM manipulation for toasts to avoid destroying speech recognition
+        updateToastsDOM()
         setTimeout(() => {
           state.toasts = state.toasts.filter(t => t.id !== id)
-          render()
+          updateToastsDOM()
         }, 3000)
+      }
+
+      function updateToastsDOM() {
+        let container = document.getElementById('toast-container')
+        if (!container) {
+          container = document.createElement('div')
+          container.id = 'toast-container'
+          container.className = 'fixed top-4 left-1/2 transform -translate-x-1/2 z-50 space-y-2'
+          document.body.appendChild(container)
+        }
+        const colors = { success: 'bg-green-500', error: 'bg-red-500', warning: 'bg-yellow-500', info: 'bg-blue-500' }
+        container.innerHTML = state.toasts.map(t =>
+          '<div class="toast ' + (colors[t.type] || colors.info) + ' text-white px-6 py-3 rounded-lg shadow-lg font-arabic text-sm">' + t.message + '</div>'
+        ).join('')
       }
 
       function updateInterimDisplay(text) {
@@ -1184,9 +1308,6 @@ app.get('/*', (c) => {
         
         let html = ''
         
-        // Toast notifications
-        html += renderToasts()
-        
         // Onboarding
         if (state.showOnboarding) {
           html += renderOnboarding()
@@ -1211,6 +1332,9 @@ app.get('/*', (c) => {
             break
           case 'surah-list':
             html += renderSurahList()
+            break
+          case 'session-detail':
+            html += renderSessionDetail()
             break
         }
         
@@ -1406,7 +1530,7 @@ app.get('/*', (c) => {
           
           // Bottom controls
           '<div class="flex-shrink-0 bg-white dark:bg-gray-800 border-t border-gray-100 dark:border-gray-700 shadow-lg">' +
-            renderBottomControls() +
+            '<div id="session-controls">' + renderBottomControlsInner() + '</div>' +
           '</div>' +
         '</div>'
       }
@@ -1501,7 +1625,7 @@ app.get('/*', (c) => {
         return html
       }
 
-      function renderBottomControls() {
+      function renderBottomControlsInner() {
         const silenceTime = state.lastSpeechTime ? Math.floor((Date.now() - state.lastSpeechTime) / 1000) : 0
         
         if (!state.sessionActive) {
@@ -1724,16 +1848,24 @@ app.get('/*', (c) => {
                 '<p class="font-arabic text-center text-gray-400 py-8">لا توجد جلسات بعد</p>' :
                 '<div class="space-y-3 max-h-96 overflow-auto">' +
                 sessions.map((s, i) => 
-                  '<div class="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
-                    '<div>' +
-                      '<p class="font-arabic text-sm text-gray-700 dark:text-gray-300">صفحة ' + s.scope_value + ' <span class="text-xs text-gray-400">(' + getDifficultyLabel(s.difficulty) + ')</span></p>' +
-                      '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">' + formatDate(s.start_time) + ' - ' + formatDuration(s.duration_seconds) + '</p>' +
+                  '<button onclick="App.viewSessionDetail(' + i + ')" class="w-full flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-600/50 transition-colors text-right">' +
+                    '<div class="flex items-center gap-3 flex-1 min-w-0">' +
+                      '<div class="flex-shrink-0 w-10 h-10 rounded-lg flex items-center justify-center ' + (getAccuracy(s) > 80 ? 'bg-green-100 dark:bg-green-900/30' : getAccuracy(s) > 50 ? 'bg-yellow-100 dark:bg-yellow-900/30' : 'bg-red-100 dark:bg-red-900/30') + '">' +
+                        '<span class="text-sm font-bold ' + (getAccuracy(s) > 80 ? 'text-green-600 dark:text-green-400' : getAccuracy(s) > 50 ? 'text-yellow-600 dark:text-yellow-400' : 'text-red-600 dark:text-red-400') + '">' + getAccuracy(s) + '%</span>' +
+                      '</div>' +
+                      '<div class="flex-1 min-w-0">' +
+                        '<p class="font-arabic text-sm text-gray-700 dark:text-gray-300">صفحة ' + s.scope_value + ' <span class="text-xs text-gray-400">(' + getDifficultyLabel(s.difficulty) + ')</span></p>' +
+                        '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">' + formatDate(s.start_time) + ' - ' + formatDuration(s.duration_seconds) + '</p>' +
+                      '</div>' +
                     '</div>' +
-                    '<div class="text-left">' +
-                      '<p class="text-lg font-bold ' + (getAccuracy(s) > 80 ? 'text-green-500' : getAccuracy(s) > 50 ? 'text-yellow-500' : 'text-red-500') + '">' + getAccuracy(s) + '%</p>' +
-                      '<p class="text-xs text-gray-400">' + s.correct_words + '/' + s.total_words + '</p>' +
+                    '<div class="flex items-center gap-2 flex-shrink-0">' +
+                      '<div class="text-left">' +
+                        '<p class="text-xs text-gray-500 dark:text-gray-400">' + s.correct_words + '/' + s.total_words + '</p>' +
+                        (s.errors_count > 0 ? '<p class="text-xs text-red-500">' + s.errors_count + ' خطأ</p>' : '<p class="text-xs text-green-500">بدون أخطاء</p>') +
+                      '</div>' +
+                      '<i class="fas fa-chevron-left text-gray-400 text-xs"></i>' +
                     '</div>' +
-                  '</div>'
+                  '</button>'
                 ).join('') +
                 '</div>'
               ) +
@@ -1750,6 +1882,149 @@ app.get('/*', (c) => {
                 '</div>' +
               '</div>'
             : '') +
+          '</div>' +
+        '</div>'
+      }
+
+      // ==========================================
+      // SESSION DETAIL VIEW
+      // ==========================================
+      function viewSessionDetail(index) {
+        state.selectedSession = state.sessionHistory[index]
+        state.currentView = 'session-detail'
+        render()
+      }
+
+      function renderSessionDetail() {
+        const s = state.selectedSession
+        if (!s) return renderAnalytics()
+        
+        const accuracy = getAccuracy(s)
+        const accuracyColor = accuracy > 80 ? 'text-green-500' : accuracy > 50 ? 'text-yellow-500' : 'text-red-500'
+        const errors = s.error_details || []
+        
+        // Group errors by type
+        const errorsByType = {}
+        errors.forEach(err => {
+          const t = err.error_type || 'other'
+          if (!errorsByType[t]) errorsByType[t] = []
+          errorsByType[t].push(err)
+        })
+        
+        // Group errors by ayah
+        const errorsByAyah = {}
+        errors.forEach(err => {
+          const loc = err.word_location || ''
+          const ayahKey = loc.split(':').slice(0, 2).join(':')
+          if (!errorsByAyah[ayahKey]) errorsByAyah[ayahKey] = []
+          errorsByAyah[ayahKey].push(err)
+        })
+        
+        return '<div class="min-h-screen bg-gray-50 dark:bg-gray-900">' +
+          // Header
+          '<header class="bg-white dark:bg-gray-800 shadow-sm border-b border-gray-100 dark:border-gray-700">' +
+            '<div class="max-w-4xl mx-auto px-4 py-4 flex items-center justify-between">' +
+              '<button onclick="App.navigate(&apos;analytics&apos;)" class="p-2 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700">' +
+                '<i class="fas fa-arrow-right text-gray-600 dark:text-gray-400"></i>' +
+              '</button>' +
+              '<h2 class="font-arabic font-bold text-gray-800 dark:text-white">تفاصيل الجلسة</h2>' +
+              '<div></div>' +
+            '</div>' +
+          '</header>' +
+          
+          '<div class="max-w-4xl mx-auto px-4 py-6 space-y-5">' +
+            
+            // Session summary card
+            '<div class="bg-white dark:bg-gray-800 rounded-2xl p-6 shadow-sm">' +
+              '<div class="flex items-center justify-between mb-4">' +
+                '<div>' +
+                  '<h3 class="font-arabic font-bold text-lg text-gray-800 dark:text-white">صفحة ' + s.scope_value + '</h3>' +
+                  '<p class="font-arabic text-sm text-gray-500 dark:text-gray-400">' + formatDate(s.start_time) + '</p>' +
+                '</div>' +
+                '<div class="w-16 h-16 rounded-full border-4 ' + (accuracy > 80 ? 'border-green-500' : accuracy > 50 ? 'border-yellow-500' : 'border-red-500') + ' flex items-center justify-center">' +
+                  '<span class="text-xl font-bold ' + accuracyColor + '">' + accuracy + '%</span>' +
+                '</div>' +
+              '</div>' +
+              
+              // Stats row
+              '<div class="grid grid-cols-4 gap-3">' +
+                '<div class="text-center p-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
+                  '<p class="text-lg font-bold text-green-500">' + s.correct_words + '</p>' +
+                  '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">صحيح</p>' +
+                '</div>' +
+                '<div class="text-center p-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
+                  '<p class="text-lg font-bold text-gray-600 dark:text-gray-300">' + s.total_words + '</p>' +
+                  '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">إجمالي</p>' +
+                '</div>' +
+                '<div class="text-center p-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
+                  '<p class="text-lg font-bold text-red-500">' + s.errors_count + '</p>' +
+                  '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">أخطاء</p>' +
+                '</div>' +
+                '<div class="text-center p-2 bg-gray-50 dark:bg-gray-700/50 rounded-lg">' +
+                  '<p class="text-lg font-bold text-blue-500">' + formatDuration(s.duration_seconds) + '</p>' +
+                  '<p class="font-arabic text-xs text-gray-500 dark:text-gray-400">المدة</p>' +
+                '</div>' +
+              '</div>' +
+              
+              // Difficulty & mode
+              '<div class="flex gap-2 mt-3">' +
+                '<span class="font-arabic text-xs px-3 py-1 rounded-full bg-quran-gold/10 text-quran-gold">' + getDifficultyLabel(s.difficulty) + '</span>' +
+                '<span class="font-arabic text-xs px-3 py-1 rounded-full bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400">صفحة ' + s.scope_value + '</span>' +
+              '</div>' +
+            '</div>' +
+            
+            // Error summary by type
+            (errors.length > 0 ?
+              '<div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-sm">' +
+                '<h3 class="font-arabic font-bold text-gray-800 dark:text-white mb-4"><i class="fas fa-chart-pie text-quran-gold ml-2"></i>ملخص الأخطاء حسب النوع</h3>' +
+                '<div class="grid grid-cols-2 gap-3">' +
+                  (errorsByType['forget'] ? 
+                    '<div class="flex items-center gap-2 p-3 bg-purple-50 dark:bg-purple-900/20 rounded-lg">' +
+                      '<div class="w-8 h-8 bg-purple-500 rounded-full flex items-center justify-center"><i class="fas fa-brain text-white text-xs"></i></div>' +
+                      '<div><p class="font-arabic text-sm font-bold text-purple-700 dark:text-purple-400">نسيان</p><p class="text-xs text-purple-600 dark:text-purple-300">' + errorsByType['forget'].length + ' كلمة</p></div>' +
+                    '</div>' : '') +
+                  (errorsByType['substitution'] ? 
+                    '<div class="flex items-center gap-2 p-3 bg-red-50 dark:bg-red-900/20 rounded-lg">' +
+                      '<div class="w-8 h-8 bg-red-500 rounded-full flex items-center justify-center"><i class="fas fa-exchange-alt text-white text-xs"></i></div>' +
+                      '<div><p class="font-arabic text-sm font-bold text-red-700 dark:text-red-400">إبدال</p><p class="text-xs text-red-600 dark:text-red-300">' + errorsByType['substitution'].length + ' كلمة</p></div>' +
+                    '</div>' : '') +
+                  (errorsByType['order'] ? 
+                    '<div class="flex items-center gap-2 p-3 bg-orange-50 dark:bg-orange-900/20 rounded-lg">' +
+                      '<div class="w-8 h-8 bg-orange-500 rounded-full flex items-center justify-center"><i class="fas fa-sort text-white text-xs"></i></div>' +
+                      '<div><p class="font-arabic text-sm font-bold text-orange-700 dark:text-orange-400">ترتيب</p><p class="text-xs text-orange-600 dark:text-orange-300">' + errorsByType['order'].length + ' كلمة</p></div>' +
+                    '</div>' : '') +
+                  (errorsByType['pronunciation'] ? 
+                    '<div class="flex items-center gap-2 p-3 bg-yellow-50 dark:bg-yellow-900/20 rounded-lg">' +
+                      '<div class="w-8 h-8 bg-yellow-500 rounded-full flex items-center justify-center"><i class="fas fa-volume-up text-white text-xs"></i></div>' +
+                      '<div><p class="font-arabic text-sm font-bold text-yellow-700 dark:text-yellow-400">نطق</p><p class="text-xs text-yellow-600 dark:text-yellow-300">' + errorsByType['pronunciation'].length + ' كلمة</p></div>' +
+                    '</div>' : '') +
+                '</div>' +
+              '</div>'
+            : '') +
+            
+            // Detailed errors list grouped by ayah
+            (errors.length > 0 ?
+              '<div class="bg-white dark:bg-gray-800 rounded-2xl p-5 shadow-sm">' +
+                '<h3 class="font-arabic font-bold text-gray-800 dark:text-white mb-4"><i class="fas fa-list-ol text-red-500 ml-2"></i>تفاصيل الأخطاء</h3>' +
+                '<div class="space-y-4">' +
+                renderGroupedErrors(errorsByAyah) +
+                '</div>' +
+              '</div>'
+            : '<div class="bg-green-50 dark:bg-green-900/20 rounded-2xl p-8 text-center">' +
+                '<i class="fas fa-check-circle text-green-500 text-4xl mb-3"></i>' +
+                '<p class="font-arabic text-lg text-green-600 dark:text-green-400 font-bold">ما شاء الله! لا توجد أخطاء</p>' +
+                '<p class="font-arabic text-sm text-green-500 dark:text-green-400 mt-1">أداء ممتاز في هذه الجلسة</p>' +
+              '</div>') +
+            
+            // Action buttons
+            '<div class="flex gap-3">' +
+              '<button onclick="App.navigate(&apos;analytics&apos;)" class="flex-1 bg-gray-200 dark:bg-gray-700 hover:bg-gray-300 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 font-arabic font-bold py-3 rounded-xl transition-colors">' +
+                '<i class="fas fa-arrow-right ml-1"></i>الرجوع' +
+              '</button>' +
+              '<button onclick="App.goToPageFromDetail(' + s.scope_value + ')" class="flex-1 bg-quran-gold hover:bg-yellow-600 text-white font-arabic font-bold py-3 rounded-xl transition-colors">' +
+                '<i class="fas fa-redo ml-1"></i>إعادة تسميع الصفحة' +
+              '</button>' +
+            '</div>' +
           '</div>' +
         '</div>'
       }
@@ -1963,6 +2238,53 @@ app.get('/*', (c) => {
         }[type] || 'bg-gray-100 text-gray-700'
       }
 
+      // Render error rows grouped by ayah for session detail
+      function renderGroupedErrors(errorsByAyah) {
+        var html = ''
+        var keys = Object.keys(errorsByAyah)
+        for (var k = 0; k < keys.length; k++) {
+          var ayahKey = keys[k]
+          var ayahErrors = errorsByAyah[ayahKey]
+          html += '<div class="border border-gray-200 dark:border-gray-600 rounded-xl overflow-hidden">'
+          html += '<div class="bg-gray-50 dark:bg-gray-700/50 px-4 py-2 flex items-center justify-between">'
+          html += '<span class="font-arabic text-sm font-bold text-gray-700 dark:text-gray-300"><i class="fas fa-bookmark text-quran-gold ml-1"></i>الآية ' + ayahKey + '</span>'
+          html += '<span class="text-xs px-2 py-0.5 rounded-full bg-red-100 dark:bg-red-900/30 text-red-600 dark:text-red-400">' + ayahErrors.length + ' خطأ</span>'
+          html += '</div>'
+          html += '<div class="divide-y divide-gray-100 dark:divide-gray-700">'
+          for (var e = 0; e < ayahErrors.length; e++) {
+            html += renderSingleError(ayahErrors[e])
+          }
+          html += '</div></div>'
+        }
+        return html
+      }
+
+      function renderSingleError(err) {
+        var h = '<div class="px-4 py-3"><div class="flex items-start gap-3">'
+        h += '<div class="flex-shrink-0 w-7 h-7 rounded-full flex items-center justify-center mt-1 ' + getErrorTypeColor(err.error_type) + '">'
+        h += '<i class="fas ' + getErrorTypeIcon(err.error_type) + ' text-white" style="font-size:10px"></i></div>'
+        h += '<div class="flex-1 min-w-0">'
+        h += '<div class="flex items-center gap-2 mb-1">'
+        h += '<span class="font-quran text-xl text-gray-800 dark:text-white">' + err.expected_text + '</span>'
+        h += '<span class="font-arabic text-xs px-2 py-0.5 rounded-full ' + getErrorTypeBadge(err.error_type) + '">' + getErrorTypeLabel(err.error_type) + '</span>'
+        h += '</div>'
+        if (err.recognized_text) {
+          h += '<div class="flex items-center gap-1 mb-1"><span class="font-arabic text-xs text-gray-500 dark:text-gray-400">سُمع:</span>'
+          h += '<span class="font-quran text-base text-red-500 dark:text-red-400">' + err.recognized_text + '</span></div>'
+        } else {
+          h += '<p class="font-arabic text-xs text-gray-400 mb-1">لم يُسمع شيء</p>'
+        }
+        h += '<div class="flex items-center gap-3 text-xs text-gray-400">'
+        h += '<span><i class="fas fa-map-marker-alt ml-1"></i>' + (err.word_location || '') + '</span>'
+        h += '<span><i class="fas fa-redo ml-1"></i>' + err.attempts + ' محاولة</span>'
+        h += '<span><i class="fas fa-layer-group ml-1"></i>سطر ' + (err.line_number || '-') + '</span>'
+        if (err.severity === 'manual_reveal') {
+          h += '<span class="text-purple-500"><i class="fas fa-eye ml-1"></i>كشف يدوي</span>'
+        }
+        h += '</div></div></div></div>'
+        return h
+      }
+
       // ==========================================
       // NAVIGATION
       // ==========================================
@@ -2024,6 +2346,11 @@ app.get('/*', (c) => {
         }
       }
 
+      function goToPageFromDetail(pageNum) {
+        state.currentView = 'mushaf'
+        goToPage(parseInt(pageNum))
+      }
+
       function showOnboardingAgain() {
         state.showOnboarding = true
         render()
@@ -2072,6 +2399,8 @@ app.get('/*', (c) => {
         completeOnboarding,
         clearHistory,
         showOnboarding: showOnboardingAgain,
+        viewSessionDetail,
+        goToPageFromDetail,
       }
     })()
 
