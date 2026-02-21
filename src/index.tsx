@@ -603,42 +603,126 @@ app.get('/*', (c) => {
         },
 
         // Match multiple words from speech against expected sequence
-        matchSequence(spokenTokens, expectedWords, startIndex, difficulty) {
+        matchSequence(spokenTokens, expectedWords, startIndex, difficulty, revealedWords) {
           const results = []
-          let matchedCount = 0
+          let expectedIdx = startIndex
           
-          for (let i = 0; i < spokenTokens.length && (startIndex + matchedCount) < expectedWords.length; i++) {
+          for (let i = 0; i < spokenTokens.length && expectedIdx < expectedWords.length; i++) {
             const spoken = spokenTokens[i]
             if (!spoken || spoken.trim().length === 0) continue
             
-            const expected = expectedWords[startIndex + matchedCount]
+            // Check if the spoken word matches an ALREADY REVEALED word (user repeating)
+            // If so, skip this spoken token - don't count as error
+            if (revealedWords && revealedWords.size > 0) {
+              const isRepeat = this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)
+              if (isRepeat) {
+                // User repeated an already-revealed word, just skip this token
+                continue
+              }
+            }
+            
+            // Also try combining current + next token (ASR sometimes splits one Quran word into two)
+            const expected = expectedWords[expectedIdx]
             const result = this.matchWord(spoken, expected.text_uthmani, difficulty)
             
             if (result.match) {
               results.push({
-                wordIndex: startIndex + matchedCount,
+                wordIndex: expectedIdx,
                 word: expected,
                 confidence: result.confidence,
                 matchType: result.type,
                 spoken: spoken
               })
-              matchedCount++
+              expectedIdx++
+              // Skip past any already-revealed words
+              while (expectedIdx < expectedWords.length && revealedWords && revealedWords.has(expectedIdx)) {
+                expectedIdx++
+              }
             } else {
-              // Check if it's an order error (word exists in scope but wrong position)
-              const isOrderError = this.checkOrderError(spoken, expectedWords, startIndex + matchedCount, difficulty)
-              results.push({
-                wordIndex: startIndex + matchedCount,
-                word: expected,
-                confidence: result.confidence,
-                matchType: 'error',
-                errorType: isOrderError ? 'order' : (result.confidence > 0.4 ? 'pronunciation' : 'substitution'),
-                spoken: spoken
-              })
-              break // Stop at first error
+              // Try combining with next spoken token (ASR may split Arabic words)
+              let combinedMatch = false
+              if (i + 1 < spokenTokens.length) {
+                const combined = spoken + ' ' + spokenTokens[i + 1]
+                const combResult = this.matchWord(combined, expected.text_uthmani, difficulty)
+                if (combResult.match) {
+                  results.push({
+                    wordIndex: expectedIdx,
+                    word: expected,
+                    confidence: combResult.confidence,
+                    matchType: combResult.type,
+                    spoken: combined
+                  })
+                  expectedIdx++
+                  while (expectedIdx < expectedWords.length && revealedWords && revealedWords.has(expectedIdx)) {
+                    expectedIdx++
+                  }
+                  i++ // Skip next token since we consumed it
+                  combinedMatch = true
+                }
+                
+                // Also try: one spoken token matches TWO expected words concatenated
+                if (!combinedMatch && expectedIdx + 1 < expectedWords.length) {
+                  const twoExpected = expected.text_uthmani + ' ' + expectedWords[expectedIdx + 1].text_uthmani
+                  const twoResult = this.matchWord(spoken, twoExpected, difficulty)
+                  if (twoResult.match) {
+                    // This spoken token matches two expected words
+                    results.push({
+                      wordIndex: expectedIdx,
+                      word: expected,
+                      confidence: twoResult.confidence,
+                      matchType: twoResult.type,
+                      spoken: spoken
+                    })
+                    results.push({
+                      wordIndex: expectedIdx + 1,
+                      word: expectedWords[expectedIdx + 1],
+                      confidence: twoResult.confidence,
+                      matchType: twoResult.type,
+                      spoken: spoken
+                    })
+                    expectedIdx += 2
+                    while (expectedIdx < expectedWords.length && revealedWords && revealedWords.has(expectedIdx)) {
+                      expectedIdx++
+                    }
+                    combinedMatch = true
+                  }
+                }
+              }
+              
+              if (!combinedMatch) {
+                // Check if it's an order error (word exists in scope but wrong position)
+                const isOrderError = this.checkOrderError(spoken, expectedWords, expectedIdx, difficulty)
+                results.push({
+                  wordIndex: expectedIdx,
+                  word: expected,
+                  confidence: result.confidence,
+                  matchType: 'error',
+                  errorType: isOrderError ? 'order' : (result.confidence > 0.4 ? 'pronunciation' : 'substitution'),
+                  spoken: spoken
+                })
+                break // Stop at first real error
+              }
             }
           }
           
           return results
+        },
+
+        // Check if a spoken word is a repeat of a recently revealed word
+        isRepeatOfRevealed(spoken, expectedWords, currentIdx, difficulty, revealedWords) {
+          const normalizedSpoken = ArabicNormalizer.normalize(spoken, difficulty)
+          // Check backwards from currentIdx for recently revealed words (within 10 words)
+          const lookback = Math.max(0, currentIdx - 10)
+          for (let i = currentIdx - 1; i >= lookback; i--) {
+            if (revealedWords.has(i)) {
+              const normalizedExpected = ArabicNormalizer.normalize(expectedWords[i].text_uthmani, difficulty)
+              if (normalizedSpoken === normalizedExpected) return true
+              // Also check similarity for fuzzy repeat detection
+              const sim = this.similarity(normalizedSpoken, normalizedExpected)
+              if (sim >= 0.85) return true
+            }
+          }
+          return false
         },
 
         // Check if spoken word exists elsewhere in scope (order error)
@@ -758,12 +842,18 @@ app.get('/*', (c) => {
           
           let finalTranscript = ''
           let interimTranscript = ''
+          const alternativeTranscripts = []
           
           for (let i = event.resultIndex; i < event.results.length; i++) {
-            const transcript = event.results[i][0].transcript
+            const result = event.results[i]
+            const transcript = result[0].transcript
             
-            if (event.results[i].isFinal) {
+            if (result.isFinal) {
               finalTranscript += transcript
+              // Collect alternatives for better matching
+              for (let alt = 1; alt < result.length; alt++) {
+                alternativeTranscripts.push(result[alt].transcript)
+              }
             } else {
               interimTranscript += transcript
             }
@@ -772,7 +862,18 @@ app.get('/*', (c) => {
           // Process final transcript
           if (finalTranscript.trim()) {
             state._lastInterim = ''
+            const beforeIndex = state.currentWordIndex
             this.processTranscript(finalTranscript.trim())
+            
+            // If primary transcript didn't match well, try alternatives
+            if (state.currentWordIndex === beforeIndex && alternativeTranscripts.length > 0) {
+              for (const alt of alternativeTranscripts) {
+                if (alt.trim()) {
+                  this.processTranscript(alt.trim())
+                  if (state.currentWordIndex > beforeIndex) break // Found a match
+                }
+              }
+            }
           }
           
           // Also try to match interim results for faster response
@@ -801,7 +902,8 @@ app.get('/*', (c) => {
             completeTokens,
             words,
             state.currentWordIndex,
-            state.difficulty
+            state.difficulty,
+            state.revealedWords
           )
           
           for (const result of results) {
@@ -832,12 +934,13 @@ app.get('/*', (c) => {
             return
           }
           
-          // Match sequence of words
+          // Match sequence of words, passing revealedWords for repeat detection
           const results = WordMatcher.matchSequence(
             spokenTokens,
             words,
             state.currentWordIndex,
-            state.difficulty
+            state.difficulty,
+            state.revealedWords
           )
           
           let anyRevealed = false
