@@ -902,15 +902,22 @@ app.get('/*', (c) => {
           const spokenTokens = transcript.split(/\\s+/).filter(t => t.length > 0)
           if (spokenTokens.length === 0) return
           
-          // Only try to match complete words from interim (not the last token which may be partial)
-          const completeTokens = spokenTokens.length > 1 ? spokenTokens.slice(0, -1) : []
-          if (completeTokens.length === 0) return
-          
-          // Snapshot revealedWords before matching to avoid mid-loop mutation issues
+          // Snapshot revealedWords before matching
           const revealedSnapshot = new Set(state.revealedWords)
           
+          // For interim: if multiple tokens, drop last (may be partial).
+          // If only 1 token, use it directly (matchSequence handles repeats, normalization, etc.)
+          let tokensToMatch
+          if (spokenTokens.length === 1) {
+            tokensToMatch = spokenTokens
+          } else {
+            tokensToMatch = spokenTokens.slice(0, -1)
+          }
+          
+          if (tokensToMatch.length === 0) return
+          
           const results = WordMatcher.matchSequence(
-            completeTokens,
+            tokensToMatch,
             words,
             state.currentWordIndex,
             state.difficulty,
@@ -945,10 +952,10 @@ app.get('/*', (c) => {
             return
           }
           
-          // Match sequence of words, passing snapshot for repeat detection
-          // Snapshot revealedWords before matching to avoid mid-loop mutation issues
+          // Snapshot revealedWords before matching
           const revealedSnapshot = new Set(state.revealedWords)
           
+          // --- Phase 1: Try matching from current expected index ---
           const results = WordMatcher.matchSequence(
             spokenTokens,
             words,
@@ -958,27 +965,76 @@ app.get('/*', (c) => {
           )
           
           let anyRevealed = false
+          let pendingError = null // Delay error recording until after Phase 2
           
           for (const result of results) {
             if (result.matchType !== 'error') {
-              // Correct word!
               revealWord(result.wordIndex)
               anyRevealed = true
             } else {
-              // Error - record attempt
-              recordAttempt(result.wordIndex, result.spoken, result.errorType)
-              
-              // Visual feedback - use direct DOM manipulation
-              flashError(result.wordIndex)
-              
-              // Haptic feedback
-              if (navigator.vibrate) navigator.vibrate(50)
+              // Don't record error yet - Phase 2 might identify this as a re-read
+              pendingError = result
               break
             }
           }
           
+          // --- Phase 2: If no match, user might be re-reading from a previous position ---
+          // Scan backwards to find where the user started re-reading
+          // This handles: user reads words 0-5, stops at word 6, then re-reads from word 3
+          if (!anyRevealed && pendingError) {
+            let rereadDetected = false
+            
+            // Try each spoken token as a possible re-read start point
+            for (let tokenStart = 0; tokenStart < spokenTokens.length; tokenStart++) {
+              const spokenWord = spokenTokens[tokenStart]
+              
+              // Check if this spoken word matches any already-revealed word
+              for (let backIdx = state.currentWordIndex - 1; backIdx >= Math.max(0, state.currentWordIndex - 30); backIdx--) {
+                if (!state.revealedWords.has(backIdx)) continue
+                const backMatch = WordMatcher.matchWord(spokenWord, words[backIdx].text_uthmani, state.difficulty)
+                if (backMatch.match) {
+                  rereadDetected = true
+                  
+                  // Try matching the remaining tokens after this re-read token
+                  // starting from the current expected word (state.currentWordIndex)
+                  const remainingTokens = spokenTokens.slice(tokenStart + 1)
+                  if (remainingTokens.length > 0) {
+                    const retryResults = WordMatcher.matchSequence(
+                      remainingTokens, words, state.currentWordIndex, state.difficulty, revealedSnapshot
+                    )
+                    for (const r of retryResults) {
+                      if (r.matchType !== 'error') {
+                        revealWord(r.wordIndex)
+                        anyRevealed = true
+                      } else {
+                        break
+                      }
+                    }
+                  }
+                  break // Found a re-read match, stop scanning backwards
+                }
+              }
+              
+              // If we found a re-read, stop scanning tokens
+              if (rereadDetected) break
+            }
+            
+            // If re-read detected (even if no new words revealed), reset speech time
+            // to prevent false silence/forget errors, and clear the pending error
+            if (rereadDetected) {
+              state.lastSpeechTime = Date.now()
+              pendingError = null // Not an error - was a re-read
+            }
+          }
+          
+          // Phase 3: If there's still a pending error (not a re-read), record it now
+          if (pendingError) {
+            recordAttempt(pendingError.wordIndex, pendingError.spoken, pendingError.errorType)
+            flashError(pendingError.wordIndex)
+            if (navigator.vibrate) navigator.vibrate(50)
+          }
+          
           if (anyRevealed) {
-            // Reset silence timer on successful match
             state.lastSpeechTime = Date.now()
           }
         },
@@ -2690,7 +2746,7 @@ export function runTests() {
   }
 
   let passed = 0
-  const total = 6
+  const total = 8
 
   // ===== Test 1: Multi-word sequence matching =====
   // Simulates reading "بسم الله الرحمن الرحيم" as a full phrase
@@ -2834,6 +2890,60 @@ export function runTests() {
     }
   } catch (e: any) {
     console.error('❌ FAIL: Test 6 - Exception: ' + e.message)
+  }
+
+  // ===== Test 7: Single-token interim matching via matchSequence =====
+  // When ASR sends a single token as interim, it should still match via matchSequence
+  // (not just direct matchWord) for consistent normalization and repeat handling
+  try {
+    const words = [
+      { text_uthmani: 'بِسْمِ' },
+      { text_uthmani: 'ٱللَّهِ' },
+      { text_uthmani: 'ٱلرَّحْمَـٰنِ' },
+    ]
+    const revealed = new Set<number>([0]) // "بسم" revealed
+    // Single token "الله" should match index 1 through matchSequence
+    const spoken = ['الله']
+    const results = WordMatcherTest.matchSequence(spoken, words, 1, 'normal', revealed)
+    const ok = results.length === 1 && results[0].wordIndex === 1 && results[0].matchType !== 'error'
+    if (ok) {
+      console.log('✅ PASS: Test 7 - Single-token interim matched via matchSequence')
+      passed++
+    } else {
+      console.error('❌ FAIL: Test 7 - Single-token interim. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
+    }
+  } catch (e: any) {
+    console.error('❌ FAIL: Test 7 - Exception: ' + e.message)
+  }
+
+  // ===== Test 8: Re-reading earlier words then continuing =====
+  // User reads words 0-4, pauses at word 5, re-reads from word 3 then says word 5
+  // Tokens: ["رب", "العالمين", "الرحمن"] where words 0-4 are revealed, current = 5
+  // "رب" and "العالمين" match revealed words 6,7 → should be skipped as re-reads
+  // "الرحمن" should match index 5 (current expected word)
+  try {
+    const wordTexts = [
+      'بِسْمِ', 'ٱللَّهِ', 'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ',
+      'ٱلْحَمْدُ', 'لِلَّهِ', 'رَبِّ', 'ٱلْعَـٰلَمِينَ',
+      'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ',
+    ]
+    const words = wordTexts.map(t => ({ text_uthmani: t }))
+    // User has revealed 0-7, currently at index 8
+    const revealed = new Set<number>([0,1,2,3,4,5,6,7])
+    // User re-reads "رب العالمين" (words 6,7) then says "الرحمن" (word 8)
+    const spoken = ['رب', 'العالمين', 'الرحمن']
+    const results = WordMatcherTest.matchSequence(spoken, words, 8, 'normal', revealed)
+    // "رب" and "العالمين" should be skipped as repeats of revealed words
+    // "الرحمن" should match index 8
+    const ok = results.length === 1 && results[0].wordIndex === 8 && results[0].matchType !== 'error'
+    if (ok) {
+      console.log('✅ PASS: Test 8 - Re-reading earlier words, then matching current word')
+      passed++
+    } else {
+      console.error('❌ FAIL: Test 8 - Re-read then continue. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType, spoken: r.spoken }))))
+    }
+  } catch (e: any) {
+    console.error('❌ FAIL: Test 8 - Exception: ' + e.message)
   }
 
   console.log('=== نتيجة الاختبارات: ' + passed + '/' + total + ' ===')
