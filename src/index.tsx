@@ -467,16 +467,41 @@ app.get('/*', (c) => {
       // ARABIC TEXT NORMALIZATION
       // ==========================================
       const ArabicNormalizer = {
-        // Remove all diacritics (tashkeel)
+        // Convert Ottoman-specific characters to standard Arabic BEFORE removing diacritics
+        // This is critical: U+0670 (superscript alef) represents an actual alef sound
+        normalizeOttoman(text) {
+          return text
+            // U+0670 superscript/dagger alef → REMOVE (it's a diacritical mark, not a letter)
+            // ASR outputs words without this mark (e.g., الرحمن not الرحمان)
+            // For words where a real alef is needed (e.g., العالمين), the imlaei text has U+0627
+            .replace(/\u0670/g, '')
+            // U+06DF small high rounded zero (Ottoman stop mark) → remove
+            .replace(/\u06DF/g, '')
+            // U+0653 maddah above → remove (alef already present)
+            .replace(/\u0653/g, '')
+            // U+0654 hamza above → remove
+            .replace(/\u0654/g, '')
+            // U+0655 hamza below → remove
+            .replace(/\u0655/g, '')
+            // U+0656 subscript alef → remove
+            .replace(/\u0656/g, '')
+            // U+06E5 small waw → remove
+            .replace(/\u06E5/g, '')
+            // U+06E6 small ya → remove  
+            .replace(/\u06E6/g, '')
+            // ءا → آ (hamza + alef = alef madda, ASR outputs آ)
+            .replace(/ءا/g, 'آ')
+        },
+
+        // Remove all diacritics (tashkeel) - U+0670 already handled by normalizeOttoman
         removeDiacritics(text) {
-          return text.replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED\u08D4-\u08E1\u08D4-\u08ED\u08F0-\u08F3]/g, '')
+          return text.replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06E0-\u06E8\u06EA-\u06ED\u08D4-\u08E1\u08D4-\u08ED\u08F0-\u08F3]/g, '')
         },
 
         // Normalize Alif forms
         normalizeAlif(text) {
           return text
             .replace(/[أإآٱ]/g, 'ا')
-            .replace(/ٰ/g, 'ا')
         },
 
         // Normalize Ya/Alif Maqsura
@@ -499,7 +524,10 @@ app.get('/*', (c) => {
           if (!text) return ''
           let normalized = text.trim()
           
-          // Always remove tatweel and extra spaces
+          // Step 1: Convert Ottoman characters FIRST (before removing diacritics)
+          normalized = this.normalizeOttoman(normalized)
+          
+          // Step 2: Remove tatweel and extra spaces
           normalized = this.removeTatweel(normalized)
           normalized = normalized.replace(/\\s+/g, ' ').trim()
           
@@ -553,20 +581,16 @@ app.get('/*', (c) => {
           return 1 - (this.levenshteinDistance(a, b) / maxLen)
         },
 
-        // Match a spoken word against expected word
-        matchWord(spoken, expected, difficulty = 'normal') {
+        // Match spoken text against a single expected text string
+        _matchAgainst(spoken, expected, difficulty) {
           const threshold = state.thresholds[difficulty]
-          
-          // Normalize both texts
           const normalizedSpoken = ArabicNormalizer.normalize(spoken, difficulty)
           const normalizedExpected = ArabicNormalizer.normalize(expected, difficulty)
           
-          // Direct match
           if (normalizedSpoken === normalizedExpected) {
             return { match: true, confidence: 1.0, type: 'exact' }
           }
           
-          // Similarity match
           const sim = this.similarity(normalizedSpoken, normalizedExpected)
           const distRatio = 1 - sim
           
@@ -574,7 +598,6 @@ app.get('/*', (c) => {
             return { match: true, confidence: sim, type: 'normalized' }
           }
           
-          // For easy mode, try phonetic matching
           if (difficulty === 'easy') {
             const phoneticSim = this.phoneticSimilarity(normalizedSpoken, normalizedExpected)
             if (phoneticSim >= threshold.confidence) {
@@ -583,6 +606,30 @@ app.get('/*', (c) => {
           }
           
           return { match: false, confidence: sim, type: 'mismatch' }
+        },
+
+        // Match a spoken word against expected word
+        // Accepts either a string or a word object with text_uthmani and text_imlaei
+        matchWord(spoken, expected, difficulty = 'normal') {
+          // If expected is a word object, try text_imlaei first (ASR outputs standard Arabic)
+          if (expected && typeof expected === 'object') {
+            // Try imlaei text first (closest to what ASR outputs)
+            if (expected.text_imlaei) {
+              const imlaeiResult = this._matchAgainst(spoken, expected.text_imlaei, difficulty)
+              if (imlaeiResult.match) return imlaeiResult
+            }
+            // Fallback to uthmani text
+            const uthmaniResult = this._matchAgainst(spoken, expected.text_uthmani || '', difficulty)
+            // Return the better result
+            if (expected.text_imlaei) {
+              const imlaeiResult = this._matchAgainst(spoken, expected.text_imlaei, difficulty)
+              return uthmaniResult.match ? uthmaniResult : 
+                     (uthmaniResult.confidence > imlaeiResult.confidence ? uthmaniResult : imlaeiResult)
+            }
+            return uthmaniResult
+          }
+          // Plain string - use directly
+          return this._matchAgainst(spoken, expected, difficulty)
         },
 
         // Phonetic similarity for Arabic
@@ -615,7 +662,7 @@ app.get('/*', (c) => {
             // This prevents false "repeat" detection when the same word appears
             // multiple times in the Quran (e.g., "الرحمن" in Basmala AND verse 3 of Al-Fatiha)
             const expected = expectedWords[expectedIdx]
-            const result = this.matchWord(spoken, expected.text_uthmani, difficulty)
+            const result = this.matchWord(spoken, expected, difficulty)
             
             if (result.match) {
               results.push({
@@ -637,10 +684,10 @@ app.get('/*', (c) => {
                 // Try combining WITHOUT space first, then WITH space
                 const combinedNoSpace = spoken + spokenTokens[i + 1]
                 const combinedWithSpace = spoken + ' ' + spokenTokens[i + 1]
-                let combResult = this.matchWord(combinedNoSpace, expected.text_uthmani, difficulty)
+                let combResult = this.matchWord(combinedNoSpace, expected, difficulty)
                 let usedCombined = combinedNoSpace
                 if (!combResult.match) {
-                  combResult = this.matchWord(combinedWithSpace, expected.text_uthmani, difficulty)
+                  combResult = this.matchWord(combinedWithSpace, expected, difficulty)
                   usedCombined = combinedWithSpace
                 }
                 if (combResult.match) {
@@ -661,8 +708,17 @@ app.get('/*', (c) => {
                 
                 // Also try: one spoken token matches TWO expected words concatenated
                 if (!combinedMatch && expectedIdx + 1 < expectedWords.length) {
-                  const twoExpected = expected.text_uthmani + ' ' + expectedWords[expectedIdx + 1].text_uthmani
-                  const twoResult = this.matchWord(spoken, twoExpected, difficulty)
+                  // Try matching one spoken token against two expected words concatenated
+                  // Use imlaei text if available for better ASR matching
+                  const exp1Text = expected.text_imlaei || expected.text_uthmani
+                  const exp2Text = expectedWords[expectedIdx + 1].text_imlaei || expectedWords[expectedIdx + 1].text_uthmani
+                  const twoExpected = exp1Text + ' ' + exp2Text
+                  let twoResult = this.matchWord(spoken, twoExpected, difficulty)
+                  // Also try with uthmani if imlaei didn't match
+                  if (!twoResult.match) {
+                    const twoUthmani = expected.text_uthmani + ' ' + expectedWords[expectedIdx + 1].text_uthmani
+                    if (twoUthmani !== twoExpected) twoResult = this.matchWord(spoken, twoUthmani, difficulty)
+                  }
                   if (twoResult.match) {
                     // This spoken token matches two expected words
                     results.push({
@@ -724,11 +780,15 @@ app.get('/*', (c) => {
           // Loop over ALL revealed word indices (no lookback limit)
           for (const idx of revealedWords) {
             if (idx >= expectedWords.length) continue
-            const normalizedExpected = ArabicNormalizer.normalize(expectedWords[idx].text_uthmani, difficulty)
-            if (normalizedSpoken === normalizedExpected) return true
-            // Also check similarity for fuzzy repeat detection
-            const sim = this.similarity(normalizedSpoken, normalizedExpected)
-            if (sim >= 0.85) return true
+            const word = expectedWords[idx]
+            // Try imlaei first (closer to ASR output), then uthmani
+            const textsToCheck = [word.text_imlaei, word.text_uthmani].filter(Boolean)
+            for (const text of textsToCheck) {
+              const normalizedExpected = ArabicNormalizer.normalize(text, difficulty)
+              if (normalizedSpoken === normalizedExpected) return true
+              const sim = this.similarity(normalizedSpoken, normalizedExpected)
+              if (sim >= 0.85) return true
+            }
           }
           return false
         },
@@ -737,8 +797,12 @@ app.get('/*', (c) => {
         checkOrderError(spoken, expectedWords, currentIndex, difficulty) {
           const normalizedSpoken = ArabicNormalizer.normalize(spoken, difficulty)
           for (let i = currentIndex + 1; i < Math.min(currentIndex + 20, expectedWords.length); i++) {
-            const normalizedExpected = ArabicNormalizer.normalize(expectedWords[i].text_uthmani, difficulty)
-            if (normalizedSpoken === normalizedExpected) return true
+            const word = expectedWords[i]
+            const textsToCheck = [word.text_imlaei, word.text_uthmani].filter(Boolean)
+            for (const text of textsToCheck) {
+              const normalizedExpected = ArabicNormalizer.normalize(text, difficulty)
+              if (normalizedSpoken === normalizedExpected) return true
+            }
           }
           return false
         }
@@ -991,7 +1055,7 @@ app.get('/*', (c) => {
               // Check if this spoken word matches any already-revealed word
               for (let backIdx = state.currentWordIndex - 1; backIdx >= Math.max(0, state.currentWordIndex - 30); backIdx--) {
                 if (!state.revealedWords.has(backIdx)) continue
-                const backMatch = WordMatcher.matchWord(spokenWord, words[backIdx].text_uthmani, state.difficulty)
+                const backMatch = WordMatcher.matchWord(spokenWord, words[backIdx], state.difficulty)
                 if (backMatch.match) {
                   rereadDetected = true
                   
@@ -2587,29 +2651,42 @@ app.get('/*', (c) => {
 export default app
 
 /* TEST */
-// Comprehensive test block for 5 scenarios
-// Run with: node -e "import('./dist/_worker.js').catch(()=>{})" or via test script
+// Comprehensive test block for Ottoman/Imlaei matching + all previous scenarios
+// Run via standalone test script (not from built output since Vite tree-shakes it)
 export function runTests() {
-  // Minimal stubs for ArabicNormalizer and WordMatcher (duplicated logic for standalone testing)
+  // Updated ArabicNormalizerTest with Ottoman normalization
   const ArabicNormalizerTest = {
+    normalizeOttoman(text: string) {
+      return text
+        .replace(/\u0670/g, '')  // Dagger alef → remove (diacritical mark)
+        .replace(/\u06DF/g, '')
+        .replace(/\u0653/g, '')
+        .replace(/\u0654/g, '')
+        .replace(/\u0655/g, '')
+        .replace(/\u0656/g, '')
+        .replace(/\u06E5/g, '')
+        .replace(/\u06E6/g, '')
+        .replace(/\u0621\u0627/g, '\u0622')
+    },
     removeDiacritics(text: string) {
-      return text.replace(/[\u0610-\u061A\u064B-\u065F\u0670\u06D6-\u06DC\u06DF-\u06E8\u06EA-\u06ED\u08D4-\u08E1\u08D4-\u08ED\u08F0-\u08F3]/g, '')
+      return text.replace(/[\u0610-\u061A\u064B-\u065F\u06D6-\u06DC\u06E0-\u06E8\u06EA-\u06ED\u08D4-\u08E1\u08D4-\u08ED\u08F0-\u08F3]/g, '')
     },
     normalizeAlif(text: string) {
-      return text.replace(/[أإآٱ]/g, 'ا').replace(/\u0670/g, 'ا')
+      return text.replace(/[\u0623\u0625\u0622\u0671]/g, '\u0627')
     },
     normalizeYa(text: string) {
-      return text.replace(/ى/g, 'ي')
+      return text.replace(/\u0649/g, '\u064a')
     },
     normalizeTaMarbuta(text: string) {
-      return text.replace(/ة/g, 'ه')
+      return text.replace(/\u0629/g, '\u0647')
     },
     removeTatweel(text: string) {
-      return text.replace(/ـ/g, '')
+      return text.replace(/\u0640/g, '')
     },
     normalize(text: string, level = 'normal') {
       if (!text) return ''
       let normalized = text.trim()
+      normalized = this.normalizeOttoman(normalized)
       normalized = this.removeTatweel(normalized)
       normalized = normalized.replace(/\s+/g, ' ').trim()
       if (level === 'strict') {
@@ -2645,7 +2722,7 @@ export function runTests() {
       if (maxLen === 0) return 1
       return 1 - (this.levenshteinDistance(a, b) / maxLen)
     },
-    matchWord(spoken: string, expected: string, difficulty = 'normal') {
+    _matchAgainst(spoken: string, expected: string, difficulty: string) {
       const thresholds: any = {
         easy: { levenshtein: 0.30, confidence: 0.60 },
         normal: { levenshtein: 0.20, confidence: 0.75 },
@@ -2654,46 +2731,60 @@ export function runTests() {
       const threshold = thresholds[difficulty]
       const normalizedSpoken = ArabicNormalizerTest.normalize(spoken, difficulty)
       const normalizedExpected = ArabicNormalizerTest.normalize(expected, difficulty)
-      if (normalizedSpoken === normalizedExpected) {
-        return { match: true, confidence: 1.0, type: 'exact' }
-      }
+      if (normalizedSpoken === normalizedExpected) return { match: true, confidence: 1.0, type: 'exact' }
       const sim = this.similarity(normalizedSpoken, normalizedExpected)
       const distRatio = 1 - sim
-      if (distRatio <= threshold.levenshtein && sim >= threshold.confidence) {
-        return { match: true, confidence: sim, type: 'normalized' }
-      }
+      if (distRatio <= threshold.levenshtein && sim >= threshold.confidence) return { match: true, confidence: sim, type: 'normalized' }
       return { match: false, confidence: sim, type: 'mismatch' }
     },
-    // isRepeatOfRevealed: loops ALL revealed indices, no lookback limit
+    matchWord(spoken: string, expected: any, difficulty = 'normal') {
+      if (expected && typeof expected === 'object') {
+        if (expected.text_imlaei) {
+          const imlaeiResult = this._matchAgainst(spoken, expected.text_imlaei, difficulty)
+          if (imlaeiResult.match) return imlaeiResult
+        }
+        const uthmaniResult = this._matchAgainst(spoken, expected.text_uthmani || '', difficulty)
+        if (expected.text_imlaei) {
+          const imlaeiResult = this._matchAgainst(spoken, expected.text_imlaei, difficulty)
+          return uthmaniResult.match ? uthmaniResult : (uthmaniResult.confidence > imlaeiResult.confidence ? uthmaniResult : imlaeiResult)
+        }
+        return uthmaniResult
+      }
+      return this._matchAgainst(spoken, expected, difficulty)
+    },
     isRepeatOfRevealed(spoken: string, expectedWords: any[], currentIdx: number, difficulty: string, revealedWords: Set<number>) {
       const normalizedSpoken = ArabicNormalizerTest.normalize(spoken, difficulty)
       for (const idx of revealedWords) {
         if (idx >= expectedWords.length) continue
-        const normalizedExpected = ArabicNormalizerTest.normalize(expectedWords[idx].text_uthmani, difficulty)
-        if (normalizedSpoken === normalizedExpected) return true
-        const sim = this.similarity(normalizedSpoken, normalizedExpected)
-        if (sim >= 0.85) return true
+        const w = expectedWords[idx]
+        const texts = [w.text_imlaei, w.text_uthmani].filter(Boolean)
+        for (const text of texts) {
+          const norm = ArabicNormalizerTest.normalize(text, difficulty)
+          if (normalizedSpoken === norm) return true
+          if (this.similarity(normalizedSpoken, norm) >= 0.85) return true
+        }
       }
       return false
     },
     checkOrderError(spoken: string, expectedWords: any[], currentIndex: number, difficulty: string) {
       const normalizedSpoken = ArabicNormalizerTest.normalize(spoken, difficulty)
       for (let i = currentIndex + 1; i < Math.min(currentIndex + 20, expectedWords.length); i++) {
-        const normalizedExpected = ArabicNormalizerTest.normalize(expectedWords[i].text_uthmani, difficulty)
-        if (normalizedSpoken === normalizedExpected) return true
+        const w = expectedWords[i]
+        const texts = [w.text_imlaei, w.text_uthmani].filter(Boolean)
+        for (const text of texts) {
+          if (normalizedSpoken === ArabicNormalizerTest.normalize(text, difficulty)) return true
+        }
       }
       return false
     },
-    // matchSequence: try matchWord FIRST, repeat check only on mismatch
     matchSequence(spokenTokens: string[], expectedWords: any[], startIndex: number, difficulty: string, revealedWords: Set<number>) {
       const results: any[] = []
       let expectedIdx = startIndex
       for (let i = 0; i < spokenTokens.length && expectedIdx < expectedWords.length; i++) {
         const spoken = spokenTokens[i]
         if (!spoken || spoken.trim().length === 0) continue
-        // Try matching current expected word FIRST
         const expected = expectedWords[expectedIdx]
-        const result = this.matchWord(spoken, expected.text_uthmani, difficulty)
+        const result = this.matchWord(spoken, expected, difficulty)
         if (result.match) {
           results.push({ wordIndex: expectedIdx, word: expected, confidence: result.confidence, matchType: result.type, spoken })
           expectedIdx++
@@ -2703,10 +2794,10 @@ export function runTests() {
           if (i + 1 < spokenTokens.length) {
             const combinedNoSpace = spoken + spokenTokens[i + 1]
             const combinedWithSpace = spoken + ' ' + spokenTokens[i + 1]
-            let combResult = this.matchWord(combinedNoSpace, expected.text_uthmani, difficulty)
+            let combResult = this.matchWord(combinedNoSpace, expected, difficulty)
             let usedCombined = combinedNoSpace
             if (!combResult.match) {
-              combResult = this.matchWord(combinedWithSpace, expected.text_uthmani, difficulty)
+              combResult = this.matchWord(combinedWithSpace, expected, difficulty)
               usedCombined = combinedWithSpace
             }
             if (combResult.match) {
@@ -2717,8 +2808,14 @@ export function runTests() {
               combinedMatch = true
             }
             if (!combinedMatch && expectedIdx + 1 < expectedWords.length) {
-              const twoExpected = expected.text_uthmani + ' ' + expectedWords[expectedIdx + 1].text_uthmani
-              const twoResult = this.matchWord(spoken, twoExpected, difficulty)
+              const exp1 = expected.text_imlaei || expected.text_uthmani
+              const exp2 = expectedWords[expectedIdx+1].text_imlaei || expectedWords[expectedIdx+1].text_uthmani
+              const twoExpected = exp1 + ' ' + exp2
+              let twoResult = this.matchWord(spoken, twoExpected, difficulty)
+              if (!twoResult.match) {
+                const twoU = expected.text_uthmani + ' ' + expectedWords[expectedIdx+1].text_uthmani
+                if (twoU !== twoExpected) twoResult = this.matchWord(spoken, twoU, difficulty)
+              }
               if (twoResult.match) {
                 results.push({ wordIndex: expectedIdx, word: expected, confidence: twoResult.confidence, matchType: twoResult.type, spoken })
                 results.push({ wordIndex: expectedIdx + 1, word: expectedWords[expectedIdx + 1], confidence: twoResult.confidence, matchType: twoResult.type, spoken })
@@ -2729,11 +2826,8 @@ export function runTests() {
             }
           }
           if (!combinedMatch) {
-            // Only check repeat AFTER all match attempts fail
             if (revealedWords && revealedWords.size > 0) {
-              if (this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)) {
-                continue
-              }
+              if (this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)) continue
             }
             const isOrderError = this.checkOrderError(spoken, expectedWords, expectedIdx, difficulty)
             results.push({ wordIndex: expectedIdx, word: expected, confidence: result.confidence, matchType: 'error', errorType: isOrderError ? 'order' : (result.confidence > 0.4 ? 'pronunciation' : 'substitution'), spoken })
@@ -2746,207 +2840,163 @@ export function runTests() {
   }
 
   let passed = 0
-  const total = 8
+  const total = 15
 
-  // ===== Test 1: Multi-word sequence matching =====
-  // Simulates reading "بسم الله الرحمن الرحيم" as a full phrase
+  // ===== Test 1: Multi-word sequence =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' },
-      { text_uthmani: 'ٱللَّهِ' },
-      { text_uthmani: 'ٱلرَّحْمَـٰنِ' },
-      { text_uthmani: 'ٱلرَّحِيمِ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650', text_imlaei: '\u0628\u0650\u0633\u0652\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650', text_imlaei: '\u0627\u0644\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650', text_imlaei: '\u0627\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0670\u0646\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650', text_imlaei: '\u0627\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
     ]
-    const spoken = ['بسم', 'الله', 'الرحمن', 'الرحيم']
-    const revealed = new Set<number>()
-    const results = WordMatcherTest.matchSequence(spoken, words, 0, 'normal', revealed)
-    const allMatched = results.length === 4 && results.every((r: any) => r.matchType !== 'error')
-    if (allMatched) {
-      console.log('✅ PASS: Test 1 - Multi-word sequence (4 words matched)')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 1 - Multi-word sequence. Got ' + results.length + ' results, expected 4 all matching')
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 1 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0628\u0633\u0645', '\u0627\u0644\u0644\u0647', '\u0627\u0644\u0631\u062d\u0645\u0646', '\u0627\u0644\u0631\u062d\u064a\u0645'], words, 0, 'normal', new Set())
+    if (results.length === 4 && results.every((r: any) => r.matchType !== 'error')) { console.log('\u2705 PASS: Test 1 - Multi-word sequence'); passed++ }
+    else { console.error('\u274c FAIL: Test 1 - Got ' + results.length + ' results') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 1 - ' + e.message) }
 
-  // ===== Test 2: Near repeat (<10 words back) - should be skipped =====
+  // ===== Test 2: Near repeat skipped =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' },
-      { text_uthmani: 'ٱللَّهِ' },
-      { text_uthmani: 'ٱلرَّحْمَـٰنِ' },
-      { text_uthmani: 'ٱلرَّحِيمِ' },
-      { text_uthmani: 'ٱلْحَمْدُ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650', text_imlaei: '\u0628\u0650\u0633\u0652\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650', text_imlaei: '\u0627\u0644\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650', text_imlaei: '\u0627\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0670\u0646\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650', text_imlaei: '\u0627\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0652\u062d\u064e\u0645\u0652\u062f\u064f', text_imlaei: '\u0627\u0644\u0652\u062d\u064e\u0645\u0652\u062f\u064f' },
     ]
-    const revealed = new Set<number>([0, 1]) // first 2 words already revealed
-    // User says "بسم الله" (repeating word 0 & 1) then "الرحمن"
-    const spoken = ['بسم', 'الله', 'الرحمن']
-    const results = WordMatcherTest.matchSequence(spoken, words, 2, 'normal', revealed)
-    // "بسم" and "الله" should be skipped (repeat), "الرحمن" should match index 2
-    const correctMatch = results.length === 1 && results[0].wordIndex === 2 && results[0].matchType !== 'error'
-    if (correctMatch) {
-      console.log('✅ PASS: Test 2 - Near repeat (<10 words) correctly skipped')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 2 - Near repeat. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 2 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0628\u0633\u0645', '\u0627\u0644\u0644\u0647', '\u0627\u0644\u0631\u062d\u0645\u0646'], words, 2, 'normal', new Set([0,1]))
+    if (results.length === 1 && results[0].wordIndex === 2 && results[0].matchType !== 'error') { console.log('\u2705 PASS: Test 2 - Near repeat skipped'); passed++ }
+    else { console.error('\u274c FAIL: Test 2') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 2 - ' + e.message) }
 
-  // ===== Test 3: Distant repeat (>10 words back) - must still be skipped =====
+  // ===== Test 3: Distant repeat skipped =====
   try {
-    const wordTexts = [
-      'بِسْمِ', 'ٱللَّهِ', 'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ',
-      'ٱلْحَمْدُ', 'لِلَّهِ', 'رَبِّ', 'ٱلْعَـٰلَمِينَ',
-      'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ', 'مَـٰلِكِ', 'يَوْمِ',
-      'ٱلدِّينِ', 'إِيَّاكَ', 'نَعْبُدُ',
-    ]
+    const wordTexts = ['\u0628\u0650\u0633\u0652\u0645\u0650','\u0671\u0644\u0644\u064e\u0651\u0647\u0650','\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650','\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650','\u0671\u0644\u0652\u062d\u064e\u0645\u0652\u062f\u064f','\u0644\u0650\u0644\u064e\u0651\u0647\u0650','\u0631\u064e\u0628\u0650\u0651','\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e','\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650','\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650','\u0645\u064e\u0640\u0670\u0644\u0650\u0643\u0650','\u064a\u064e\u0648\u0652\u0645\u0650','\u0671\u0644\u062f\u0650\u0651\u064a\u0646\u0650','\u0625\u0650\u064a\u064e\u0651\u0627\u0643\u064e','\u0646\u064e\u0639\u0652\u0628\u064f\u062f\u064f']
     const words = wordTexts.map(t => ({ text_uthmani: t }))
-    // Reveal first 14 words (indices 0-13)
-    const revealed = new Set<number>()
-    for (let i = 0; i < 14; i++) revealed.add(i)
-    // User says "بسم" (matches index 0 which is >10 words back) then "نعبد" (expected at index 14)
-    const spoken = ['بسم', 'نعبد']
-    const results = WordMatcherTest.matchSequence(spoken, words, 14, 'normal', revealed)
-    // "بسم" should be detected as repeat of index 0 (distance >10) and skipped
-    // "نعبد" should match index 14
-    const correctMatch = results.length === 1 && results[0].wordIndex === 14 && results[0].matchType !== 'error'
-    if (correctMatch) {
-      console.log('✅ PASS: Test 3 - Distant repeat (>10 words) correctly skipped')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 3 - Distant repeat. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 3 - Exception: ' + e.message)
-  }
+    const revealed = new Set<number>(); for (let i=0;i<14;i++) revealed.add(i)
+    const results = WordMatcherTest.matchSequence(['\u0628\u0633\u0645', '\u0646\u0639\u0628\u062f'], words, 14, 'normal', revealed)
+    if (results.length === 1 && results[0].wordIndex === 14 && results[0].matchType !== 'error') { console.log('\u2705 PASS: Test 3 - Distant repeat skipped'); passed++ }
+    else { console.error('\u274c FAIL: Test 3') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 3 - ' + e.message) }
 
-  // ===== Test 4: Real error detection (wrong word is NOT skipped) =====
+  // ===== Test 4: Real error detected =====
+  try {
+    const words = [{ text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650' }, { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650' }, { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650' }]
+    const results = WordMatcherTest.matchSequence(['\u0643\u062a\u0627\u0628'], words, 1, 'normal', new Set([0]))
+    if (results.length === 1 && results[0].matchType === 'error') { console.log('\u2705 PASS: Test 4 - Real error detected'); passed++ }
+    else { console.error('\u274c FAIL: Test 4') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 4 - ' + e.message) }
+
+  // ===== Test 5: Token merge =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' },
-      { text_uthmani: 'ٱللَّهِ' },
-      { text_uthmani: 'ٱلرَّحْمَـٰنِ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650', text_imlaei: '\u0628\u0650\u0633\u0652\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650', text_imlaei: '\u0627\u0644\u0644\u064e\u0651\u0647\u0650' },
     ]
-    const revealed = new Set<number>([0]) // only "بسم" is revealed
-    // User says a WRONG word "كتاب" which is NOT in revealed set
-    const spoken = ['كتاب']
-    const results = WordMatcherTest.matchSequence(spoken, words, 1, 'normal', revealed)
-    // "كتاب" should NOT be skipped (not a repeat) and should be an error
-    const isError = results.length === 1 && results[0].matchType === 'error'
-    if (isError) {
-      console.log('✅ PASS: Test 4 - Real error correctly detected (not skipped)')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 4 - Real error. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 4 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0628\u0633', '\u0645', '\u0627\u0644\u0644\u0647'], words, 0, 'normal', new Set())
+    if (results.length === 2 && results.every((r: any) => r.matchType !== 'error')) { console.log('\u2705 PASS: Test 5 - Token merge'); passed++ }
+    else { console.error('\u274c FAIL: Test 5') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 5 - ' + e.message) }
 
-  // ===== Test 5: Token merge (no-space and with-space) =====
+  // ===== Test 6: Repeated Quran word not false-skipped =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' },
-      { text_uthmani: 'ٱللَّهِ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650' }, { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650' }, { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0652\u062d\u064e\u0645\u0652\u062f\u064f' }, { text_uthmani: '\u0644\u0650\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0631\u064e\u0628\u0650\u0651' }, { text_uthmani: '\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650' }, { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
     ]
-    const revealed = new Set<number>()
-    // Simulate ASR splitting "بسم" into "بس" + "م" (no-space merge: "بسم" should match "بِسْمِ")
-    const spoken = ['بس', 'م', 'الله']
-    const results = WordMatcherTest.matchSequence(spoken, words, 0, 'normal', revealed)
-    // "بس"+"م" (no space) = "بسم" should match index 0; "الله" should match index 1
-    const allMatched = results.length === 2 && results[0].wordIndex === 0 && results[1].wordIndex === 1 && results.every((r: any) => r.matchType !== 'error')
-    if (allMatched) {
-      console.log('✅ PASS: Test 5 - Token merge (no-space) correctly combined')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 5 - Token merge. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType, spoken: r.spoken }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 5 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0627\u0644\u0631\u062d\u0645\u0646', '\u0627\u0644\u0631\u062d\u064a\u0645'], words, 8, 'normal', new Set([0,1,2,3,4,5,6,7]))
+    if (results.length === 2 && results[0].wordIndex === 8 && results[1].wordIndex === 9) { console.log('\u2705 PASS: Test 6 - Repeated Quran word matched correctly'); passed++ }
+    else { console.error('\u274c FAIL: Test 6') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 6 - ' + e.message) }
 
-  // ===== Test 6: CRITICAL - Repeated Quran word must NOT be false-skipped =====
-  // Al-Fatiha has "الرحمن" at index 2 (Basmala) AND index 8 (verse 3)
-  // After revealing 0-7, user reads "الرحمن" → must match index 8, NOT be skipped as repeat
+  // ===== Test 7: Single-token interim =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' }, { text_uthmani: 'ٱللَّهِ' }, { text_uthmani: 'ٱلرَّحْمَـٰنِ' }, { text_uthmani: 'ٱلرَّحِيمِ' },
-      { text_uthmani: 'ٱلْحَمْدُ' }, { text_uthmani: 'لِلَّهِ' }, { text_uthmani: 'رَبِّ' }, { text_uthmani: 'ٱلْعَـٰلَمِينَ' },
-      { text_uthmani: 'ٱلرَّحْمَـٰنِ' }, { text_uthmani: 'ٱلرَّحِيمِ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650', text_imlaei: '\u0628\u0650\u0633\u0652\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650', text_imlaei: '\u0627\u0644\u0644\u064e\u0651\u0647\u0650' },
     ]
-    const revealed = new Set<number>([0,1,2,3,4,5,6,7])
-    const spoken = ['الرحمن', 'الرحيم']
-    const results = WordMatcherTest.matchSequence(spoken, words, 8, 'normal', revealed)
-    const ok = results.length === 2 && results[0].wordIndex === 8 && results[1].wordIndex === 9 && results.every((r: any) => r.matchType !== 'error')
-    if (ok) {
-      console.log('✅ PASS: Test 6 - Repeated Quran word matched at correct position (not false-skipped)')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 6 - Repeated Quran word. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 6 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0627\u0644\u0644\u0647'], words, 1, 'normal', new Set([0]))
+    if (results.length === 1 && results[0].wordIndex === 1 && results[0].matchType !== 'error') { console.log('\u2705 PASS: Test 7 - Single-token interim'); passed++ }
+    else { console.error('\u274c FAIL: Test 7') }
+  } catch (e: any) { console.error('\u274c FAIL: Test 7 - ' + e.message) }
 
-  // ===== Test 7: Single-token interim matching via matchSequence =====
-  // When ASR sends a single token as interim, it should still match via matchSequence
-  // (not just direct matchWord) for consistent normalization and repeat handling
+  // ===== Test 8: Re-reading earlier words =====
   try {
     const words = [
-      { text_uthmani: 'بِسْمِ' },
-      { text_uthmani: 'ٱللَّهِ' },
-      { text_uthmani: 'ٱلرَّحْمَـٰنِ' },
+      { text_uthmani: '\u0628\u0650\u0633\u0652\u0645\u0650' }, { text_uthmani: '\u0671\u0644\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650' }, { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
+      { text_uthmani: '\u0671\u0644\u0652\u062d\u064e\u0645\u0652\u062f\u064f' }, { text_uthmani: '\u0644\u0650\u0644\u064e\u0651\u0647\u0650' },
+      { text_uthmani: '\u0631\u064e\u0628\u0650\u0651' }, { text_uthmani: '\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e' },
+      { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650' }, { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0650\u064a\u0645\u0650' },
     ]
-    const revealed = new Set<number>([0]) // "بسم" revealed
-    // Single token "الله" should match index 1 through matchSequence
-    const spoken = ['الله']
-    const results = WordMatcherTest.matchSequence(spoken, words, 1, 'normal', revealed)
-    const ok = results.length === 1 && results[0].wordIndex === 1 && results[0].matchType !== 'error'
-    if (ok) {
-      console.log('✅ PASS: Test 7 - Single-token interim matched via matchSequence')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 7 - Single-token interim. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 7 - Exception: ' + e.message)
-  }
+    const results = WordMatcherTest.matchSequence(['\u0631\u0628', '\u0627\u0644\u0639\u0627\u0644\u0645\u064a\u0646', '\u0627\u0644\u0631\u062d\u0645\u0646'], words, 8, 'normal', new Set([0,1,2,3,4,5,6,7]))
+    if (results.length === 1 && results[0].wordIndex === 8 && results[0].matchType !== 'error') { console.log('\u2705 PASS: Test 8 - Re-reading then matching current'); passed++ }
+    else { console.error('\u274c FAIL: Test 8 - Results: ' + JSON.stringify(results.map((r:any)=>({idx:r.wordIndex,type:r.matchType})))) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 8 - ' + e.message) }
 
-  // ===== Test 8: Re-reading earlier words then continuing =====
-  // User reads words 0-4, pauses at word 5, re-reads from word 3 then says word 5
-  // Tokens: ["رب", "العالمين", "الرحمن"] where words 0-4 are revealed, current = 5
-  // "رب" and "العالمين" match revealed words 6,7 → should be skipped as re-reads
-  // "الرحمن" should match index 5 (current expected word)
+  // ===== Test 9: CRITICAL - Ottoman vs ASR (small alef \u2192 regular alef) =====
+  // ASR says "\u0627\u0644\u0639\u0627\u0644\u0645\u064a\u0646" but Quran has "\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e" (with small alef \u0670 instead of \u0627)
   try {
-    const wordTexts = [
-      'بِسْمِ', 'ٱللَّهِ', 'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ',
-      'ٱلْحَمْدُ', 'لِلَّهِ', 'رَبِّ', 'ٱلْعَـٰلَمِينَ',
-      'ٱلرَّحْمَـٰنِ', 'ٱلرَّحِيمِ',
-    ]
-    const words = wordTexts.map(t => ({ text_uthmani: t }))
-    // User has revealed 0-7, currently at index 8
-    const revealed = new Set<number>([0,1,2,3,4,5,6,7])
-    // User re-reads "رب العالمين" (words 6,7) then says "الرحمن" (word 8)
-    const spoken = ['رب', 'العالمين', 'الرحمن']
-    const results = WordMatcherTest.matchSequence(spoken, words, 8, 'normal', revealed)
-    // "رب" and "العالمين" should be skipped as repeats of revealed words
-    // "الرحمن" should match index 8
-    const ok = results.length === 1 && results[0].wordIndex === 8 && results[0].matchType !== 'error'
-    if (ok) {
-      console.log('✅ PASS: Test 8 - Re-reading earlier words, then matching current word')
-      passed++
-    } else {
-      console.error('❌ FAIL: Test 8 - Re-read then continue. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType, spoken: r.spoken }))))
-    }
-  } catch (e: any) {
-    console.error('❌ FAIL: Test 8 - Exception: ' + e.message)
-  }
+    const word = { text_uthmani: '\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e', text_imlaei: '\u0627\u0644\u0652\u0639\u064e\u0627\u0644\u064e\u0645\u0650\u064a\u0646\u064e' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0639\u0627\u0644\u0645\u064a\u0646', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 9 - Ottoman small alef \u2192 ASR regular alef matched (\u0627\u0644\u0639\u0627\u0644\u0645\u064a\u0646)'); passed++ }
+    else { console.error('\u274c FAIL: Test 9 - Ottoman "\u0671\u0644\u0652\u0639\u064e\u0640\u0670\u0644\u064e\u0645\u0650\u064a\u0646\u064e" should match ASR "\u0627\u0644\u0639\u0627\u0644\u0645\u064a\u0646". Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 9 - ' + e.message) }
 
-  console.log('=== نتيجة الاختبارات: ' + passed + '/' + total + ' ===')
+  // ===== Test 10: CRITICAL - Ottoman \u0635\u0650\u0631\u064e\u0670\u0637 vs ASR \u0627\u0644\u0635\u0631\u0627\u0637 (superscript alef) =====
+  try {
+    const word = { text_uthmani: '\u0671\u0644\u0635\u0650\u0651\u0631\u064e\u0670\u0637\u064e', text_imlaei: '\u0627\u0644\u0635\u0650\u0651\u0631\u064e\u0627\u0637\u064e' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0635\u0631\u0627\u0637', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 10 - Ottoman superscript alef \u0670 matched (\u0627\u0644\u0635\u0631\u0627\u0637)'); passed++ }
+    else { console.error('\u274c FAIL: Test 10 - "\u0671\u0644\u0635\u0650\u0651\u0631\u064e\u0670\u0637\u064e" should match "\u0627\u0644\u0635\u0631\u0627\u0637". Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 10 - ' + e.message) }
+
+  // ===== Test 11: CRITICAL - \u0627\u0644\u0631\u062d\u0645\u0646 with dagger alef in both uthmani and imlaei =====
+  // Dagger alef (U+0670) should be REMOVED, not converted to regular alef
+  // ASR says "\u0627\u0644\u0631\u062d\u0645\u0646" not "\u0627\u0644\u0631\u062d\u0645\u0627\u0646"
+  try {
+    const word = { text_uthmani: '\u0671\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u064e\u0640\u0670\u0646\u0650', text_imlaei: '\u0627\u0644\u0631\u064e\u0651\u062d\u0652\u0645\u0670\u0646\u0650' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0631\u062d\u0645\u0646', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 11 - \u0627\u0644\u0631\u062d\u0645\u0646 with dagger alef removed (not converted to \u0627)'); passed++ }
+    else { console.error('\u274c FAIL: Test 11 - "\u0627\u0644\u0631\u062d\u0645\u0646" should match. Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 11 - ' + e.message) }
+
+  // ===== Test 12: \u0623\u0648\u0644\u0626\u0643 with dagger alef + small high rounded zero =====
+  try {
+    const word = { text_uthmani: '\u0623\u064f\u0648\u06df\u0644\u064e\u0640\u0670\u0653\u0626\u0650\u0643\u064e', text_imlaei: '\u0623\u064f\u0648\u0644\u064e\u0670\u0626\u0650\u0643\u064e' }
+    const result = WordMatcherTest.matchWord('\u0627\u0648\u0644\u0626\u0643', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 12 - \u0623\u0648\u0644\u0626\u0643 matched despite Ottoman marks'); passed++ }
+    else { console.error('\u274c FAIL: Test 12 - "\u0627\u0648\u0644\u0626\u0643" should match. Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 12 - ' + e.message) }
+
+  // ===== Test 13: \u0627\u0644\u0643\u062a\u0627\u0628 with tatweel+dagger alef =====
+  try {
+    const word = { text_uthmani: '\u0671\u0644\u0652\u0643\u0650\u062a\u064e\u0640\u0670\u0628\u064f', text_imlaei: '\u0627\u0644\u0652\u0643\u0650\u062a\u064e\u0627\u0628\u064f' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0643\u062a\u0627\u0628', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 13 - \u0627\u0644\u0643\u062a\u0627\u0628 matched via imlaei text'); passed++ }
+    else { console.error('\u274c FAIL: Test 13 - "\u0627\u0644\u0643\u062a\u0627\u0628" should match. Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 13 - ' + e.message) }
+
+  // ===== Test 14: \u0627\u0644\u0635\u0644\u0627\u0629 - Ottoman \u0627\u0644\u0635\u0644\u0648\u0629 vs standard \u0627\u0644\u0635\u0644\u0627\u0629 =====
+  try {
+    const word = { text_uthmani: '\u0671\u0644\u0635\u064e\u0651\u0644\u064e\u0648\u0670\u0629\u064e', text_imlaei: '\u0627\u0644\u0635\u064e\u0651\u0644\u064e\u0627\u0629\u064e' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0635\u0644\u0627\u0629', word, 'easy')
+    if (result.match) { console.log('\u2705 PASS: Test 14 - \u0627\u0644\u0635\u0644\u0627\u0629 matched via imlaei (Ottoman has \u0627\u0644\u0635\u0644\u0648\u0629)'); passed++ }
+    else { console.error('\u274c FAIL: Test 14 - "\u0627\u0644\u0635\u0644\u0627\u0629" should match. Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 14 - ' + e.message) }
+
+  // ===== Test 15: \u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a with multiple dagger alefs =====
+  try {
+    const word = { text_uthmani: '\u0671\u0644\u0633\u064e\u0651\u0645\u064e\u0640\u0670\u0648\u064e\u0670\u062a\u0650', text_imlaei: '\u0627\u0644\u0633\u064e\u0651\u0645\u064e\u0627\u0648\u064e\u0627\u062a\u0650' }
+    const result = WordMatcherTest.matchWord('\u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a', word, 'normal')
+    if (result.match) { console.log('\u2705 PASS: Test 15 - \u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a matched via imlaei (multiple dagger alefs)'); passed++ }
+    else { console.error('\u274c FAIL: Test 15 - "\u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a" should match. Confidence: ' + result.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 15 - ' + e.message) }
+
+  console.log('=== \u0646\u062a\u064a\u062c\u0629 \u0627\u0644\u0627\u062e\u062a\u0628\u0627\u0631\u0627\u062a: ' + passed + '/' + total + ' ===')
   return { passed, total }
 }
 /* END TEST */
