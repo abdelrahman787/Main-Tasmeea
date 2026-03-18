@@ -611,17 +611,9 @@ app.get('/*', (c) => {
             const spoken = spokenTokens[i]
             if (!spoken || spoken.trim().length === 0) continue
             
-            // Check if the spoken word matches an ALREADY REVEALED word (user repeating)
-            // If so, skip this spoken token - don't count as error
-            if (revealedWords && revealedWords.size > 0) {
-              const isRepeat = this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)
-              if (isRepeat) {
-                // User repeated an already-revealed word, just skip this token
-                continue
-              }
-            }
-            
-            // Also try combining current + next token (ASR sometimes splits one Quran word into two)
+            // IMPORTANT: Try to match the CURRENT expected word FIRST
+            // This prevents false "repeat" detection when the same word appears
+            // multiple times in the Quran (e.g., "الرحمن" in Basmala AND verse 3 of Al-Fatiha)
             const expected = expectedWords[expectedIdx]
             const result = this.matchWord(spoken, expected.text_uthmani, difficulty)
             
@@ -697,6 +689,17 @@ app.get('/*', (c) => {
               }
               
               if (!combinedMatch) {
+                // Before recording an error, check if the spoken word is a REPEAT
+                // of an already-revealed word (user accidentally re-said a previous word)
+                // Only skip if it does NOT match the current expected word (already checked above)
+                if (revealedWords && revealedWords.size > 0) {
+                  const isRepeat = this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)
+                  if (isRepeat) {
+                    // User repeated an already-revealed word, skip this token silently
+                    continue
+                  }
+                }
+                
                 // Check if it's an order error (word exists in scope but wrong position)
                 const isOrderError = this.checkOrderError(spoken, expectedWords, expectedIdx, difficulty)
                 results.push({
@@ -2625,17 +2628,14 @@ export function runTests() {
       }
       return false
     },
-    // matchSequence with snapshot support, no-space + with-space token merge
+    // matchSequence: try matchWord FIRST, repeat check only on mismatch
     matchSequence(spokenTokens: string[], expectedWords: any[], startIndex: number, difficulty: string, revealedWords: Set<number>) {
       const results: any[] = []
       let expectedIdx = startIndex
       for (let i = 0; i < spokenTokens.length && expectedIdx < expectedWords.length; i++) {
         const spoken = spokenTokens[i]
         if (!spoken || spoken.trim().length === 0) continue
-        if (revealedWords && revealedWords.size > 0) {
-          const isRepeat = this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)
-          if (isRepeat) continue
-        }
+        // Try matching current expected word FIRST
         const expected = expectedWords[expectedIdx]
         const result = this.matchWord(spoken, expected.text_uthmani, difficulty)
         if (result.match) {
@@ -2673,6 +2673,12 @@ export function runTests() {
             }
           }
           if (!combinedMatch) {
+            // Only check repeat AFTER all match attempts fail
+            if (revealedWords && revealedWords.size > 0) {
+              if (this.isRepeatOfRevealed(spoken, expectedWords, expectedIdx, difficulty, revealedWords)) {
+                continue
+              }
+            }
             const isOrderError = this.checkOrderError(spoken, expectedWords, expectedIdx, difficulty)
             results.push({ wordIndex: expectedIdx, word: expected, confidence: result.confidence, matchType: 'error', errorType: isOrderError ? 'order' : (result.confidence > 0.4 ? 'pronunciation' : 'substitution'), spoken })
             break
@@ -2684,7 +2690,7 @@ export function runTests() {
   }
 
   let passed = 0
-  const total = 5
+  const total = 6
 
   // ===== Test 1: Multi-word sequence matching =====
   // Simulates reading "بسم الله الرحمن الرحيم" as a full phrase
@@ -2805,6 +2811,29 @@ export function runTests() {
     }
   } catch (e: any) {
     console.error('❌ FAIL: Test 5 - Exception: ' + e.message)
+  }
+
+  // ===== Test 6: CRITICAL - Repeated Quran word must NOT be false-skipped =====
+  // Al-Fatiha has "الرحمن" at index 2 (Basmala) AND index 8 (verse 3)
+  // After revealing 0-7, user reads "الرحمن" → must match index 8, NOT be skipped as repeat
+  try {
+    const words = [
+      { text_uthmani: 'بِسْمِ' }, { text_uthmani: 'ٱللَّهِ' }, { text_uthmani: 'ٱلرَّحْمَـٰنِ' }, { text_uthmani: 'ٱلرَّحِيمِ' },
+      { text_uthmani: 'ٱلْحَمْدُ' }, { text_uthmani: 'لِلَّهِ' }, { text_uthmani: 'رَبِّ' }, { text_uthmani: 'ٱلْعَـٰلَمِينَ' },
+      { text_uthmani: 'ٱلرَّحْمَـٰنِ' }, { text_uthmani: 'ٱلرَّحِيمِ' },
+    ]
+    const revealed = new Set<number>([0,1,2,3,4,5,6,7])
+    const spoken = ['الرحمن', 'الرحيم']
+    const results = WordMatcherTest.matchSequence(spoken, words, 8, 'normal', revealed)
+    const ok = results.length === 2 && results[0].wordIndex === 8 && results[1].wordIndex === 9 && results.every((r: any) => r.matchType !== 'error')
+    if (ok) {
+      console.log('✅ PASS: Test 6 - Repeated Quran word matched at correct position (not false-skipped)')
+      passed++
+    } else {
+      console.error('❌ FAIL: Test 6 - Repeated Quran word. Results: ' + JSON.stringify(results.map((r: any) => ({ idx: r.wordIndex, type: r.matchType }))))
+    }
+  } catch (e: any) {
+    console.error('❌ FAIL: Test 6 - Exception: ' + e.message)
   }
 
   console.log('=== نتيجة الاختبارات: ' + passed + '/' + total + ' ===')
