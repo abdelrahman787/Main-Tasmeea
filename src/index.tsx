@@ -19,7 +19,7 @@ app.get('/api/quran/page/:pageNumber', async (c) => {
   }
 
   try {
-    const url = `https://api.quran.com/api/v4/verses/by_page/${pageNumber}?words=true&fields=text_uthmani&per_page=50&word_fields=text_uthmani,text_imlaei,line_number,page_number,location,code_v2,v2_page`
+    const url = `https://api.quran.com/api/v4/verses/by_page/${pageNumber}?words=true&fields=text_uthmani&per_page=50&word_fields=text_uthmani,text_imlaei,text_qpc_hafs,line_number,page_number,location,code_v2,v2_page`
     const response = await fetch(url)
     const data = await response.json() as any
 
@@ -36,6 +36,7 @@ app.get('/api/quran/page/:pageNumber', async (c) => {
             position: word.position,
             text_uthmani: word.text_uthmani,
             text_imlaei: word.text_imlaei,
+            text_qpc_hafs: word.text_qpc_hafs,
             line_number: word.line_number,
             page_number: word.page_number,
             location: word.location,
@@ -61,6 +62,7 @@ app.get('/api/quran/page/:pageNumber', async (c) => {
           id: w.id,
           position: w.position,
           text_uthmani: w.text_uthmani,
+          text_qpc_hafs: w.text_qpc_hafs,
           line_number: w.line_number,
           char_type_name: w.char_type_name,
           location: w.location,
@@ -233,6 +235,14 @@ app.get('/*', (c) => {
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Amiri:ital,wght@0,400;0,700;1,400;1,700&family=Amiri+Quran&family=Noto+Naskh+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/@fortawesome/fontawesome-free@6.4.0/css/all.min.css" rel="stylesheet">
+    <style>
+      /* UthmanicHafs font for verse-end markers and fallback */
+      @font-face {
+        font-family: 'UthmanicHafs';
+        src: url('https://verses.quran.foundation/fonts/quran/hafs/uthmanic_hafs/UthmanicHafs1Ver18.woff2') format('woff2');
+        font-display: swap;
+      }
+    </style>
     <script>
       tailwind.config = {
         darkMode: 'class',
@@ -303,37 +313,56 @@ app.get('/*', (c) => {
         animation: slideUp 0.3s ease-out;
       }
       .quran-page {
-        background: linear-gradient(135deg, #fef9e7 0%, #fdf6d8 50%, #fef9e7 100%);
-        border: 3px double #c5a028;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.1), inset 0 0 60px rgba(197,160,40,0.05);
+        background: linear-gradient(180deg, #fdf8e8 0%, #faf3d6 30%, #f8eed0 50%, #faf3d6 70%, #fdf8e8 100%);
+        border: 3px solid #b8962a;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.12), inset 0 0 80px rgba(197,160,40,0.06);
+        position: relative;
+        overflow: hidden;
+      }
+      .quran-page::before {
+        content: '';
+        position: absolute;
+        top: 4px; right: 4px; bottom: 4px; left: 4px;
+        border: 1px solid rgba(184,150,42,0.4);
+        pointer-events: none;
+        border-radius: 8px;
       }
       .dark .quran-page {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #1a1a2e 100%);
-        border-color: #c5a028;
-        box-shadow: 0 4px 20px rgba(0,0,0,0.4), inset 0 0 60px rgba(197,160,40,0.03);
+        background: linear-gradient(180deg, #1e1e32 0%, #1a1a2e 30%, #161628 50%, #1a1a2e 70%, #1e1e32 100%);
+        border-color: #9e8530;
+        box-shadow: 0 4px 24px rgba(0,0,0,0.5), inset 0 0 80px rgba(197,160,40,0.02);
+      }
+      .dark .quran-page::before {
+        border-color: rgba(158,133,48,0.3);
       }
       .quran-line {
-        min-height: 48px;
+        min-height: 52px;
         display: flex;
-        justify-content: center;
-        align-items: baseline;
-        gap: 6px;
-        flex-wrap: wrap;
+        justify-content: space-between;
+        align-items: center;
         direction: rtl;
+        padding: 0 4px;
+        border-bottom: 1px solid rgba(184,150,42,0.08);
+      }
+      .quran-line:last-child {
+        border-bottom: none;
+      }
+      .dark .quran-line {
+        border-bottom-color: rgba(184,150,42,0.05);
       }
       .word-cell {
         cursor: default;
-        padding: 2px 3px;
+        padding: 2px 1px;
         border-radius: 4px;
         transition: all 0.3s ease;
         display: inline-block;
       }
       .word-cell.current-word {
-        background: rgba(197,160,40,0.15);
+        background: rgba(197,160,40,0.18);
         border-bottom: 2px solid #c5a028;
       }
       .dark .word-cell.current-word {
-        background: rgba(197,160,40,0.1);
+        background: rgba(197,160,40,0.12);
       }
       .word-cell.error-flash {
         background: rgba(239, 68, 68, 0.15);
@@ -342,11 +371,68 @@ app.get('/*', (c) => {
         display: inline-flex;
         align-items: center;
         justify-content: center;
-        width: 32px;
-        height: 32px;
-        font-size: 14px;
-        color: #c5a028;
+        font-family: 'UthmanicHafs', serif;
+        color: #8b7d3c;
         position: relative;
+      }
+      .dark .ayah-marker {
+        color: #b8962a;
+      }
+      /* QCF font word styling */
+      .qcf-word {
+        display: inline-block;
+        line-height: 1;
+      }
+      .qcf-word.loading {
+        font-family: 'UthmanicHafs', 'Amiri Quran', serif;
+        opacity: 0.7;
+      }
+      .dark .qcf-word {
+        color: #d4c89a !important;
+      }
+      .dark .qcf-word.word-hidden {
+        color: transparent !important;
+      }
+      /* Surah header within Mushaf page */
+      .mushaf-surah-header {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        padding: 6px 16px;
+        margin: 4px 0 8px;
+        background: linear-gradient(90deg, transparent 0%, rgba(184,150,42,0.12) 20%, rgba(184,150,42,0.2) 50%, rgba(184,150,42,0.12) 80%, transparent 100%);
+        border-top: 2px solid rgba(184,150,42,0.35);
+        border-bottom: 2px solid rgba(184,150,42,0.35);
+        position: relative;
+      }
+      .mushaf-surah-header::before,
+      .mushaf-surah-header::after {
+        content: '❊';
+        color: #b8962a;
+        font-size: 14px;
+      }
+      .dark .mushaf-surah-header {
+        background: linear-gradient(90deg, transparent 0%, rgba(184,150,42,0.08) 20%, rgba(184,150,42,0.12) 50%, rgba(184,150,42,0.08) 80%, transparent 100%);
+        border-top-color: rgba(158,133,48,0.3);
+        border-bottom-color: rgba(158,133,48,0.3);
+      }
+      .mushaf-bismillah {
+        text-align: center;
+        padding: 2px 0 6px;
+        font-family: 'UthmanicHafs', 'Amiri Quran', serif;
+        font-size: 22px;
+        color: #3d3520;
+      }
+      .dark .mushaf-bismillah {
+        color: #d4c89a;
+      }
+      /* Page footer */
+      .mushaf-page-footer {
+        text-align: center;
+        padding-top: 6px;
+        border-top: 1px solid rgba(184,150,42,0.2);
+        margin-top: 4px;
       }
       /* Scrollbar styling */
       ::-webkit-scrollbar { width: 6px; }
@@ -362,7 +448,7 @@ app.get('/*', (c) => {
         transform: scale(1.1);
       }
 
-      /* Surah header decoration */
+      /* Surah header decoration (outside mushaf) */
       .surah-header {
         background: linear-gradient(90deg, transparent 0%, rgba(197,160,40,0.1) 30%, rgba(197,160,40,0.2) 50%, rgba(197,160,40,0.1) 70%, transparent 100%);
         border-top: 1px solid rgba(197,160,40,0.3);
@@ -390,8 +476,10 @@ app.get('/*', (c) => {
       /* Mobile adjustments */
       @media (max-width: 640px) {
         .quran-line {
-          gap: 4px;
-          min-height: 40px;
+          min-height: 42px;
+        }
+        .qcf-word {
+          font-size: 24px !important;
         }
       }
     </style>
@@ -461,6 +549,101 @@ app.get('/*', (c) => {
         
         // Toast messages
         toasts: [],
+      }
+
+      // ==========================================
+      // QCF V2 FONT LOADING (Madinah Mushaf)
+      // ==========================================
+      const QCFFontLoader = {
+        loadedFonts: new Set(),
+        loadingFonts: new Map(), // page -> Promise
+        CDN_BASE: 'https://verses.quran.foundation',
+
+        async loadPageFont(pageNumber) {
+          const fontName = 'p' + pageNumber + '-v2'
+          if (this.loadedFonts.has(fontName)) return fontName
+
+          // If already loading, wait for it
+          if (this.loadingFonts.has(pageNumber)) {
+            return this.loadingFonts.get(pageNumber)
+          }
+
+          const promise = (async () => {
+            try {
+              const fontFace = new FontFace(
+                fontName,
+                "url('" + this.CDN_BASE + "/fonts/quran/hafs/v2/woff2/p" + pageNumber + ".woff2')"
+              )
+              fontFace.display = 'block'
+              await fontFace.load()
+              document.fonts.add(fontFace)
+              this.loadedFonts.add(fontName)
+              // Inject CSS class for this page font
+              this.injectFontCSS(pageNumber, fontName)
+              return fontName
+            } catch (error) {
+              console.error('Failed to load QCF font for page ' + pageNumber + ':', error)
+              return null
+            } finally {
+              this.loadingFonts.delete(pageNumber)
+            }
+          })()
+
+          this.loadingFonts.set(pageNumber, promise)
+          return promise
+        },
+        
+        // Inject a CSS class for the font so we don't need inline styles
+        injectFontCSS(pageNumber, fontName) {
+          const styleId = 'qcf-style-p' + pageNumber
+          if (document.getElementById(styleId)) return
+          const style = document.createElement('style')
+          style.id = styleId
+          style.textContent = '.qcf-p' + pageNumber + ' { font-family: "' + fontName + '", serif; color: #2c2416; }'
+          style.textContent += ' .dark .qcf-p' + pageNumber + ' { color: #d4c89a; }'
+          style.textContent += ' .dark .qcf-p' + pageNumber + '.word-hidden { color: transparent; }'
+          document.head.appendChild(style)
+        },
+
+        async loadPageFonts(pageNumbers) {
+          const unique = [...new Set(pageNumbers)]
+          await Promise.all(unique.map(p => this.loadPageFont(p)))
+        },
+
+        isFontLoaded(pageNumber) {
+          return this.loadedFonts.has('p' + pageNumber + '-v2')
+        },
+
+        getFontFamily(pageNumber) {
+          return 'p' + pageNumber + '-v2'
+        }
+      }
+
+      // Surah names lookup (Arabic)
+      const SURAH_NAMES = {
+        1: 'الفاتحة', 2: 'البقرة', 3: 'آل عمران', 4: 'النساء', 5: 'المائدة',
+        6: 'الأنعام', 7: 'الأعراف', 8: 'الأنفال', 9: 'التوبة', 10: 'يونس',
+        11: 'هود', 12: 'يوسف', 13: 'الرعد', 14: 'إبراهيم', 15: 'الحجر',
+        16: 'النحل', 17: 'الإسراء', 18: 'الكهف', 19: 'مريم', 20: 'طه',
+        21: 'الأنبياء', 22: 'الحج', 23: 'المؤمنون', 24: 'النور', 25: 'الفرقان',
+        26: 'الشعراء', 27: 'النمل', 28: 'القصص', 29: 'العنكبوت', 30: 'الروم',
+        31: 'لقمان', 32: 'السجدة', 33: 'الأحزاب', 34: 'سبأ', 35: 'فاطر',
+        36: 'يس', 37: 'الصافات', 38: 'ص', 39: 'الزمر', 40: 'غافر',
+        41: 'فصلت', 42: 'الشورى', 43: 'الزخرف', 44: 'الدخان', 45: 'الجاثية',
+        46: 'الأحقاف', 47: 'محمد', 48: 'الفتح', 49: 'الحجرات', 50: 'ق',
+        51: 'الذاريات', 52: 'الطور', 53: 'النجم', 54: 'القمر', 55: 'الرحمن',
+        56: 'الواقعة', 57: 'الحديد', 58: 'المجادلة', 59: 'الحشر', 60: 'الممتحنة',
+        61: 'الصف', 62: 'الجمعة', 63: 'المنافقون', 64: 'التغابن', 65: 'الطلاق',
+        66: 'التحريم', 67: 'الملك', 68: 'القلم', 69: 'الحاقة', 70: 'المعارج',
+        71: 'نوح', 72: 'الجن', 73: 'المزمل', 74: 'المدثر', 75: 'القيامة',
+        76: 'الإنسان', 77: 'المرسلات', 78: 'النبأ', 79: 'النازعات', 80: 'عبس',
+        81: 'التكوير', 82: 'الانفطار', 83: 'المطففين', 84: 'الانشقاق', 85: 'البروج',
+        86: 'الطارق', 87: 'الأعلى', 88: 'الغاشية', 89: 'الفجر', 90: 'البلد',
+        91: 'الشمس', 92: 'الليل', 93: 'الضحى', 94: 'الشرح', 95: 'التين',
+        96: 'العلق', 97: 'القدر', 98: 'البينة', 99: 'الزلزلة', 100: 'العاديات',
+        101: 'القارعة', 102: 'التكاثر', 103: 'العصر', 104: 'الهمزة', 105: 'الفيل',
+        106: 'قريش', 107: 'الماعون', 108: 'الكوثر', 109: 'الكافرون', 110: 'النصر',
+        111: 'المسد', 112: 'الإخلاص', 113: 'الفلق', 114: 'الناس',
       }
 
       // ==========================================
@@ -1259,7 +1442,7 @@ app.get('/*', (c) => {
       function revealWordInDOM(index) {
         const el = document.querySelector('[data-word-index="' + index + '"]')
         if (el) {
-          const span = el.querySelector('span')
+          const span = el.querySelector('.qcf-word') || el.querySelector('span')
           if (span) {
             span.classList.remove('word-hidden')
             span.classList.add('word-revealed')
@@ -1453,7 +1636,11 @@ app.get('/*', (c) => {
         render()
         
         try {
-          const res = await fetch('/api/quran/page/' + pageNumber)
+          // Start loading both data and font in parallel
+          const [res] = await Promise.all([
+            fetch('/api/quran/page/' + pageNumber),
+            QCFFontLoader.loadPageFont(pageNumber)
+          ])
           const data = await res.json()
           state.pageData = data
         } catch(err) {
@@ -1462,6 +1649,33 @@ app.get('/*', (c) => {
         
         state.loading = false
         render()
+        
+        // If font wasn't loaded yet during render, update words after font loads
+        if (!QCFFontLoader.isFontLoaded(pageNumber)) {
+          QCFFontLoader.loadPageFont(pageNumber).then(() => {
+            updateQCFWordsInDOM(pageNumber)
+          })
+        }
+      }
+      
+      // Update fallback words with QCF font after it loads
+      function updateQCFWordsInDOM(pageNumber) {
+        document.querySelectorAll('.qcf-word.loading').forEach(function(span) {
+          const page = span.getAttribute('data-page')
+          if (parseInt(page) === pageNumber) {
+            const codeV2 = span.getAttribute('data-code-v2')
+            if (codeV2) {
+              span.classList.remove('loading')
+              span.classList.add('qcf-p' + pageNumber)
+              span.innerHTML = decodeHTMLAttr(codeV2)
+            }
+          }
+        })
+      }
+      
+      function decodeHTMLAttr(str) {
+        if (!str) return ''
+        return str.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&amp;/g, '&')
       }
 
       async function loadSurahs() {
@@ -1775,11 +1989,28 @@ app.get('/*', (c) => {
       function renderQuranPage() {
         if (!state.pageData || !state.pageData.verses) return '<p class="font-arabic text-gray-500">لا توجد بيانات</p>'
         
+        const pageNum = state.currentPage
+        const fontLoaded = QCFFontLoader.isFontLoaded(pageNum)
+        const fontFamily = QCFFontLoader.getFontFamily(pageNum)
+        
         // Group all tokens by line number
         const lineMap = new Map()
         let globalWordIndex = 0
         
+        // Track which surahs start on this page (verse_number === 1)
+        const surahStarts = new Set()
+        // Track line numbers where surah headers should appear (line before the first verse of surah)
+        const surahHeaderLines = new Map() // lineNum -> chapterId
+        
         for (const verse of state.pageData.verses) {
+          if (verse.verse_number === 1) {
+            surahStarts.add(verse.chapter_id)
+            // Find the first token's line
+            if (verse.all_tokens.length > 0) {
+              surahHeaderLines.set(verse.all_tokens[0].line_number, verse.chapter_id)
+            }
+          }
+          
           for (const token of verse.all_tokens) {
             const line = token.line_number
             if (!lineMap.has(line)) lineMap.set(line, [])
@@ -1805,19 +2036,35 @@ app.get('/*', (c) => {
         
         const sortedLines = Array.from(lineMap.entries()).sort((a, b) => a[0] - b[0])
         
-        let html = '<div class="quran-page rounded-2xl p-4 sm:p-6 max-w-2xl w-full">'
+        // Get surah names for this page
+        const chaptersOnPage = [...new Set(state.pageData.verses.map(v => v.chapter_id))]
+        const surahNamesOnPage = chaptersOnPage.map(id => SURAH_NAMES[id] || ('سورة ' + id))
         
-        // Page header
-        html += '<div class="text-center mb-4 pb-3 border-b border-quran-gold/30">'
-        html += '<span class="font-arabic text-sm text-quran-gold">صفحة ' + state.currentPage + '</span>'
+        let html = '<div class="quran-page rounded-xl p-3 sm:p-5 max-w-2xl w-full">'
         
-        // Show surah names on this page
-        const surahNames = [...new Set(state.pageData.verses.map(v => v.verse_key.split(':')[0]))]
+        // Page top bar: Juz / Surah name / Page number
+        html += '<div class="flex items-center justify-between px-2 pb-2 mb-1" style="border-bottom: 1px solid rgba(184,150,42,0.25);">'
+        html += '<span class="font-arabic text-xs" style="color:#8b7d3c;">' + surahNamesOnPage[surahNamesOnPage.length - 1] + '</span>'
+        html += '<span class="font-arabic text-xs" style="color:#8b7d3c;">' + pageNum + '</span>'
+        html += '<span class="font-arabic text-xs" style="color:#8b7d3c;">' + surahNamesOnPage[0] + '</span>'
         html += '</div>'
         
         // Render lines
         for (const [lineNum, tokens] of sortedLines) {
-          html += '<div class="quran-line py-1.5">'
+          // Check if a surah header should appear before this line
+          if (surahHeaderLines.has(lineNum)) {
+            const chId = surahHeaderLines.get(lineNum)
+            const surahName = SURAH_NAMES[chId] || ('سورة ' + chId)
+            html += '<div class="mushaf-surah-header">'
+            html += '<span class="font-arabic text-sm font-bold" style="color:#6b5c1f;">سورة ' + surahName + '</span>'
+            html += '</div>'
+            // Add Bismillah for all surahs except Al-Fatiha (1) and At-Tawbah (9)
+            if (chId !== 1 && chId !== 9) {
+              html += '<div class="mushaf-bismillah">بِسْمِ ٱللَّهِ ٱلرَّحْمَـٰنِ ٱلرَّحِيمِ</div>'
+            }
+          }
+          
+          html += '<div class="quran-line">'
           
           for (const token of tokens) {
             if (token.isWord) {
@@ -1826,26 +2073,43 @@ app.get('/*', (c) => {
               const attempts = state.wordAttempts[token.globalIndex?.toString()] 
               const hasError = attempts && attempts.count >= 2
               
-              html += '<span class="word-cell ' + 
-                (isCurrent ? 'current-word' : '') + ' ' +
-                (isRevealed ? '' : '') +
-                '" data-word-index="' + token.globalIndex + '" data-location="' + token.location + '">' +
-                '<span class="font-quran text-2xl sm:text-3xl leading-loose ' + 
-                  (state.sessionActive && !isRevealed ? 'word-hidden' : 'word-revealed') + ' ' +
-                  'text-gray-900 dark:text-gray-100' +
-                  (hasError ? ' text-red-600 dark:text-red-400' : '') +
-                '">' + token.text_uthmani + '</span>' +
-              '</span>'
+              // Use QCF V2 rendering when font is loaded, otherwise fall back
+              if (fontLoaded && token.code_v2) {
+                html += '<span class="word-cell ' + 
+                  (isCurrent ? 'current-word' : '') +
+                  '" data-word-index="' + token.globalIndex + '" data-location="' + (token.location || '') + '">' +
+                  '<span class="qcf-word qcf-p' + pageNum + ' ' + 
+                    (state.sessionActive && !isRevealed ? 'word-hidden' : 'word-revealed') +
+                    (hasError ? ' text-red-600 dark:text-red-400' : '') +
+                  '" style="font-size:28px;">' + token.code_v2 + '</span>' +
+                '</span>'
+              } else {
+                // Fallback: use UthmanicHafs with text_uthmani
+                html += '<span class="word-cell ' + 
+                  (isCurrent ? 'current-word' : '') +
+                  '" data-word-index="' + token.globalIndex + '" data-location="' + (token.location || '') + '">' +
+                  '<span class="qcf-word loading ' + 
+                    (state.sessionActive && !isRevealed ? 'word-hidden' : 'word-revealed') +
+                    (hasError ? ' text-red-600 dark:text-red-400' : '') +
+                  '" style="font-size:26px;" data-page="' + pageNum + '" data-code-v2="' + encodeHTMLAttr(token.code_v2 || '') + '">' + 
+                  (token.text_uthmani || '') + '</span>' +
+                '</span>'
+              }
             } else {
-              // Ayah end marker - always visible
-              html += '<span class="ayah-marker font-arabic">' +
-                '<span class="text-quran-gold">' + token.text_uthmani + '</span>' +
+              // Ayah end marker - always use UthmanicHafs
+              html += '<span class="ayah-marker" style="font-size:22px;">' +
+                (token.text_qpc_hafs || token.text_uthmani || '') +
               '</span>'
             }
           }
           
           html += '</div>'
         }
+        
+        // Page footer
+        html += '<div class="mushaf-page-footer">'
+        html += '<span class="font-arabic text-xs" style="color:#8b7d3c;">' + pageNum + '</span>'
+        html += '</div>'
         
         html += '</div>'
         
@@ -1860,6 +2124,12 @@ app.get('/*', (c) => {
         html += '</div>'
         
         return html
+      }
+      
+      // Helper to safely encode HTML attribute values
+      function encodeHTMLAttr(str) {
+        if (!str) return ''
+        return str.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
       }
 
       function renderBottomControlsInner() {
