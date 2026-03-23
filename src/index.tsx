@@ -530,6 +530,13 @@ app.get('/*', (c) => {
         _isRestarting: false,
         _lastInterim: '',
         _pendingRender: null,
+        _restartAttempts: 0,
+        _maxRestartAttempts: 50,
+        _keepAliveTimer: null,
+        
+        // Debug log for speech-matching analysis
+        debugLog: [],
+        showDebugPanel: localStorage.getItem('showDebugPanel') === 'true',
         
         // Settings
         difficulty: localStorage.getItem('difficulty') || 'normal',
@@ -962,20 +969,24 @@ app.get('/*', (c) => {
           return results
         },
 
-        // Check if the spoken word is a repeat of ANY already-revealed word
+        // Check if the spoken word is a repeat of an already-revealed word
+        // IMPORTANT: Only consider words that are NOT adjacent to current position
+        // (adjacent revealed words are likely legitimate - user just re-read to current point)
         isRepeatOfRevealed(spoken, expectedWords, currentIdx, difficulty, revealedWords) {
           const normalizedSpoken = ArabicNormalizer.normalize(spoken, difficulty)
-          // Loop over ALL revealed word indices (no lookback limit)
           for (const idx of revealedWords) {
             if (idx >= expectedWords.length) continue
+            // Skip words close to current position (within 2 words) - 
+            // these are likely the user re-reading from a nearby position which is normal
+            if (Math.abs(idx - currentIdx) <= 2) continue
             const word = expectedWords[idx]
-            // Try imlaei first (closer to ASR output), then uthmani
             const textsToCheck = [word.text_imlaei, word.text_uthmani].filter(Boolean)
             for (const text of textsToCheck) {
               const normalizedExpected = ArabicNormalizer.normalize(text, difficulty)
               if (normalizedSpoken === normalizedExpected) return true
+              // Use stricter threshold for repeat detection
               const sim = this.similarity(normalizedSpoken, normalizedExpected)
-              if (sim >= 0.85) return true
+              if (sim >= 0.90) return true
             }
           }
           return false
@@ -1020,6 +1031,8 @@ app.get('/*', (c) => {
           state.recognition.onaudiostart = () => {
             state.isListening = true
             state._isRestarting = false
+            state._restartAttempts = 0
+            debugAddEntry('system', '🎙️ ميكروفون نشط', '')
             softRender()
           }
           
@@ -1028,28 +1041,22 @@ app.get('/*', (c) => {
           }
           
           state.recognition.onend = () => {
-            // Auto-restart if session is active and not paused
+            // CRITICAL: Always auto-restart if session is active
             if (state.sessionActive && !state.sessionPaused) {
+              state.isListening = false
               state._isRestarting = true
-              // Use a small delay to let the browser clean up
+              state._restartAttempts++
+              
+              // Exponential backoff: 50ms, 100ms, 200ms, 400ms... max 2000ms
+              const delay = Math.min(50 * Math.pow(2, Math.min(state._restartAttempts - 1, 5)), 2000)
+              
+              debugAddEntry('system', '🔄 إعادة تشغيل (#' + state._restartAttempts + ') بعد ' + delay + 'ms', '')
+              
               setTimeout(() => {
                 if (state.sessionActive && !state.sessionPaused) {
-                  try {
-                    state.recognition.start()
-                  } catch(e) {
-                    // If start fails, re-init and retry
-                    setTimeout(() => {
-                      if (state.sessionActive && !state.sessionPaused) {
-                        try { state.recognition.start() } catch(e2) {
-                          state.isListening = false
-                          state._isRestarting = false
-                          softRender()
-                        }
-                      }
-                    }, 500)
-                  }
+                  this._doRestart()
                 }
-              }, 150)
+              }, delay)
             } else {
               state.isListening = false
               state._isRestarting = false
@@ -1060,10 +1067,35 @@ app.get('/*', (c) => {
           return true
         },
 
+        // Internal restart with re-init fallback
+        _doRestart() {
+          try {
+            state.recognition.start()
+          } catch(e) {
+            // If start fails (e.g. already started, or stale object), re-init
+            debugAddEntry('system', '⚠️ إعادة تهيئة التعرف على الكلام', e.message || '')
+            try { state.recognition.abort() } catch(e2) {}
+            state.recognition = null
+            if (this.init()) {
+              try {
+                state.recognition.start()
+              } catch(e3) {
+                // Last resort: wait and retry
+                setTimeout(() => {
+                  if (state.sessionActive && !state.sessionPaused) {
+                    this._doRestart()
+                  }
+                }, 1000)
+              }
+            }
+          }
+        },
+
         start() {
           if (!state.recognition) {
             if (!this.init()) return
           }
+          state._restartAttempts = 0
           try {
             state.recognition.start()
             state.isListening = true
@@ -1071,29 +1103,50 @@ app.get('/*', (c) => {
             state.asrFailCount = 0
             state._lastInterim = ''
             this.startSilenceMonitor()
+            this.startKeepAlive()
             render()
           } catch(e) {
-            // Already started, abort then restart
             try { state.recognition.abort() } catch(e2) {}
             setTimeout(() => {
-              try {
-                state.recognition.start()
-                state.isListening = true
-                softRender()
-              } catch(e2) {}
+              this._doRestart()
+              state.isListening = true
+              softRender()
             }, 300)
           }
         },
 
         stop() {
           state._isRestarting = false
+          state._restartAttempts = 0
           if (state.recognition) {
             try { state.recognition.abort() } catch(e) {}
           }
           state.isListening = false
           state._lastInterim = ''
           this.stopSilenceMonitor()
+          this.stopKeepAlive()
           render()
+        },
+
+        // Keep-alive: periodically check if recognition is still running
+        startKeepAlive() {
+          this.stopKeepAlive()
+          state._keepAliveTimer = setInterval(() => {
+            if (!state.sessionActive || state.sessionPaused) return
+            // If not listening and not in restart cycle, force restart
+            if (!state.isListening && !state._isRestarting) {
+              debugAddEntry('system', '🔧 Keep-alive: إعادة تشغيل تلقائية', '')
+              state._restartAttempts = 0
+              this._doRestart()
+            }
+          }, 3000)
+        },
+
+        stopKeepAlive() {
+          if (state._keepAliveTimer) {
+            clearInterval(state._keepAliveTimer)
+            state._keepAliveTimer = null
+          }
         },
 
         handleResult(event) {
@@ -1110,7 +1163,6 @@ app.get('/*', (c) => {
             
             if (result.isFinal) {
               finalTranscript += transcript
-              // Collect alternatives for better matching
               for (let alt = 1; alt < result.length; alt++) {
                 alternativeTranscripts.push(result[alt].transcript)
               }
@@ -1123,20 +1175,21 @@ app.get('/*', (c) => {
           if (finalTranscript.trim()) {
             state._lastInterim = ''
             const beforeIndex = state.currentWordIndex
-            this.processTranscript(finalTranscript.trim())
+            this.processTranscript(finalTranscript.trim(), false)
             
-            // If primary transcript didn't match well, try alternatives
+            // If primary didn't match, try alternatives
             if (state.currentWordIndex === beforeIndex && alternativeTranscripts.length > 0) {
               for (const alt of alternativeTranscripts) {
                 if (alt.trim()) {
-                  this.processTranscript(alt.trim())
-                  if (state.currentWordIndex > beforeIndex) break // Found a match
+                  debugAddEntry('alt', alt.trim(), '')
+                  this.processTranscript(alt.trim(), true)
+                  if (state.currentWordIndex > beforeIndex) break
                 }
               }
             }
           }
           
-          // Also try to match interim results for faster response
+          // Process interim results for faster response
           if (interimTranscript.trim() && interimTranscript !== state._lastInterim) {
             state._lastInterim = interimTranscript
             this.processInterim(interimTranscript.trim())
@@ -1144,7 +1197,7 @@ app.get('/*', (c) => {
           }
         },
 
-        // Process interim results - match only if confident
+        // Process interim results - match only confident exact matches
         processInterim(transcript) {
           if (!state.sessionActive || state.sessionPaused || !state.pageData) return
           
@@ -1154,22 +1207,12 @@ app.get('/*', (c) => {
           const spokenTokens = transcript.split(/\\s+/).filter(t => t.length > 0)
           if (spokenTokens.length === 0) return
           
-          // Snapshot revealedWords before matching
           const revealedSnapshot = new Set(state.revealedWords)
           
-          // For interim: if multiple tokens, drop last (may be partial).
-          // If only 1 token, use it directly (matchSequence handles repeats, normalization, etc.)
-          let tokensToMatch
-          if (spokenTokens.length === 1) {
-            tokensToMatch = spokenTokens
-          } else {
-            tokensToMatch = spokenTokens.slice(0, -1)
-          }
-          
-          if (tokensToMatch.length === 0) return
-          
+          // Use ALL interim tokens (don't drop last one - it causes delays)
+          // matchSequence will handle partial matches via similarity threshold
           const results = WordMatcher.matchSequence(
-            tokensToMatch,
+            spokenTokens,
             words,
             state.currentWordIndex,
             state.difficulty,
@@ -1177,22 +1220,23 @@ app.get('/*', (c) => {
           )
           
           for (const result of results) {
-            if (result.matchType !== 'error') {
+            if (result.matchType !== 'error' && result.confidence >= 0.85) {
+              // Only reveal on high-confidence interim matches
               revealWord(result.wordIndex)
               state.lastSpeechTime = Date.now()
+              debugAddEntry('interim-match', result.spoken, words[result.wordIndex].text_uthmani + ' ✓ (' + Math.round(result.confidence * 100) + '%)')
             } else {
               break
             }
           }
         },
 
-        processTranscript(transcript) {
+        processTranscript(transcript, isAlternative) {
           if (!state.sessionActive || state.sessionPaused || !state.pageData) return
           
           const words = state.pageData.words
           if (state.currentWordIndex >= words.length) return
           
-          // Tokenize the transcript
           const spokenTokens = transcript.split(/\\s+/).filter(t => t.length > 0)
           
           if (spokenTokens.length === 0) {
@@ -1204,7 +1248,13 @@ app.get('/*', (c) => {
             return
           }
           
-          // Snapshot revealedWords before matching
+          // Debug: log what we heard
+          if (!isAlternative) {
+            const currentWord = words[state.currentWordIndex]
+            const expectedNorm = ArabicNormalizer.normalize(currentWord.text_imlaei || currentWord.text_uthmani, state.difficulty)
+            debugAddEntry('heard', transcript, 'متوقع: ' + (currentWord.text_imlaei || currentWord.text_uthmani) + ' → ' + expectedNorm)
+          }
+          
           const revealedSnapshot = new Set(state.revealedWords)
           
           // --- Phase 1: Try matching from current expected index ---
@@ -1217,38 +1267,34 @@ app.get('/*', (c) => {
           )
           
           let anyRevealed = false
-          let pendingError = null // Delay error recording until after Phase 2
+          let pendingError = null
           
           for (const result of results) {
             if (result.matchType !== 'error') {
               revealWord(result.wordIndex)
               anyRevealed = true
+              debugAddEntry('match', result.spoken, words[result.wordIndex].text_uthmani + ' ✓ [' + result.matchType + ' ' + Math.round(result.confidence * 100) + '%]')
             } else {
-              // Don't record error yet - Phase 2 might identify this as a re-read
               pendingError = result
+              debugAddEntry('no-match', result.spoken, words[result.wordIndex].text_uthmani + ' ✗ [' + Math.round(result.confidence * 100) + '%] ' + (result.errorType || ''))
               break
             }
           }
           
-          // --- Phase 2: If no match, user might be re-reading from a previous position ---
-          // Scan backwards to find where the user started re-reading
-          // This handles: user reads words 0-5, stops at word 6, then re-reads from word 3
+          // --- Phase 2: Re-read detection ---
           if (!anyRevealed && pendingError) {
             let rereadDetected = false
             
-            // Try each spoken token as a possible re-read start point
             for (let tokenStart = 0; tokenStart < spokenTokens.length; tokenStart++) {
               const spokenWord = spokenTokens[tokenStart]
               
-              // Check if this spoken word matches any already-revealed word
               for (let backIdx = state.currentWordIndex - 1; backIdx >= Math.max(0, state.currentWordIndex - 30); backIdx--) {
                 if (!state.revealedWords.has(backIdx)) continue
                 const backMatch = WordMatcher.matchWord(spokenWord, words[backIdx], state.difficulty)
                 if (backMatch.match) {
                   rereadDetected = true
+                  debugAddEntry('re-read', spokenWord, 'أعاد قراءة كلمة #' + backIdx + ' ' + words[backIdx].text_uthmani)
                   
-                  // Try matching the remaining tokens after this re-read token
-                  // starting from the current expected word (state.currentWordIndex)
                   const remainingTokens = spokenTokens.slice(tokenStart + 1)
                   if (remainingTokens.length > 0) {
                     const retryResults = WordMatcher.matchSequence(
@@ -1258,29 +1304,47 @@ app.get('/*', (c) => {
                       if (r.matchType !== 'error') {
                         revealWord(r.wordIndex)
                         anyRevealed = true
+                        debugAddEntry('match', r.spoken, words[r.wordIndex].text_uthmani + ' ✓ (بعد إعادة)')
                       } else {
                         break
                       }
                     }
                   }
-                  break // Found a re-read match, stop scanning backwards
+                  break
                 }
               }
-              
-              // If we found a re-read, stop scanning tokens
               if (rereadDetected) break
             }
             
-            // If re-read detected (even if no new words revealed), reset speech time
-            // to prevent false silence/forget errors, and clear the pending error
             if (rereadDetected) {
               state.lastSpeechTime = Date.now()
-              pendingError = null // Not an error - was a re-read
+              pendingError = null
             }
           }
           
-          // Phase 3: If there's still a pending error (not a re-read), record it now
-          if (pendingError) {
+          // --- Phase 3: Try skipping current word ---
+          // If no match and first token was close but not enough,
+          // try matching against next word (ASR might have merged/skipped)
+          if (!anyRevealed && pendingError && state.currentWordIndex + 1 < words.length) {
+            const skipResults = WordMatcher.matchSequence(
+              spokenTokens, words, state.currentWordIndex + 1, state.difficulty, revealedSnapshot
+            )
+            if (skipResults.length > 0 && skipResults[0].matchType !== 'error') {
+              // Tokens match starting from next word - don't record error,
+              // just reveal the matching words
+              for (const r of skipResults) {
+                if (r.matchType !== 'error') {
+                  revealWord(r.wordIndex)
+                  anyRevealed = true
+                  debugAddEntry('skip-match', r.spoken, words[r.wordIndex].text_uthmani + ' ✓ (تخطي)')
+                } else break
+              }
+              pendingError = null
+            }
+          }
+          
+          // Phase 4: Record error only if all phases failed
+          if (pendingError && !isAlternative) {
             recordAttempt(pendingError.wordIndex, pendingError.spoken, pendingError.errorType)
             flashError(pendingError.wordIndex)
             if (navigator.vibrate) navigator.vibrate(50)
@@ -1293,17 +1357,19 @@ app.get('/*', (c) => {
 
         handleError(event) {
           if (event.error === 'no-speech') {
-            // Silence - don't count as ASR failure
+            debugAddEntry('system', '🔇 لا يوجد كلام', '')
             return
           }
           if (event.error === 'aborted') return
           if (event.error === 'network') {
+            debugAddEntry('system', '❌ خطأ شبكة', '')
             showToast('خطأ في الشبكة - تحقق من الاتصال', 'error')
             return
           }
           
+          debugAddEntry('system', '⚠️ خطأ ASR: ' + event.error, '')
           state.asrFailCount++
-          if (state.asrFailCount >= 3) {
+          if (state.asrFailCount >= 5) {
             showToast('الصوت غير واضح', 'warning')
             state.asrFailCount = 0
           }
@@ -1316,8 +1382,8 @@ app.get('/*', (c) => {
             
             const elapsed = (Date.now() - (state.lastSpeechTime || Date.now())) / 1000
             
-            if (elapsed >= 10) {
-              // Register forget error for current word
+            // Increase silence threshold from 10s to 15s to reduce false forgets
+            if (elapsed >= 15) {
               const words = state.pageData?.words
               if (words && state.currentWordIndex < words.length) {
                 recordForgetError(state.currentWordIndex)
@@ -1325,7 +1391,6 @@ app.get('/*', (c) => {
               }
             }
             
-            // Use soft render to update UI without destroying DOM
             softRender()
           }, 2000)
         },
@@ -1357,8 +1422,71 @@ app.get('/*', (c) => {
           errors: 0,
         }
         
+        state.debugLog = [] // Clear debug log on new session
         SpeechManager.start()
         render()
+      }
+
+      // Debug logging system
+      function debugAddEntry(type, spoken, detail) {
+        const entry = {
+          time: new Date().toLocaleTimeString('ar-EG'),
+          type: type,
+          spoken: spoken,
+          detail: detail,
+          wordIndex: state.currentWordIndex
+        }
+        state.debugLog.unshift(entry) // newest first
+        if (state.debugLog.length > 50) state.debugLog.pop() // keep last 50
+        
+        // Update debug panel if visible
+        if (state.showDebugPanel) {
+          updateDebugPanel()
+        }
+      }
+
+      function toggleDebugPanel() {
+        state.showDebugPanel = !state.showDebugPanel
+        localStorage.setItem('showDebugPanel', state.showDebugPanel.toString())
+        render()
+      }
+
+      function updateDebugPanel() {
+        const el = document.getElementById('debug-panel-content')
+        if (!el) return
+        let html = ''
+        for (const entry of state.debugLog) {
+          const colors = {
+            'heard': 'text-blue-400',
+            'match': 'text-green-400',
+            'no-match': 'text-red-400',
+            'interim-match': 'text-cyan-400',
+            're-read': 'text-yellow-400',
+            'skip-match': 'text-purple-400',
+            'alt': 'text-orange-400',
+            'system': 'text-gray-400',
+          }
+          const color = colors[entry.type] || 'text-gray-300'
+          const typeLabel = {
+            'heard': '🔊 سمع',
+            'match': '✅ طابق',
+            'no-match': '❌ لم يطابق',
+            'interim-match': '⚡ مؤقت',
+            're-read': '🔁 إعادة',
+            'skip-match': '⏭️ تخطي',
+            'alt': '🔄 بديل',
+            'system': '⚙️ نظام',
+          }
+          html += '<div class=\"text-xs font-mono leading-5 border-b border-gray-700 py-1\">'
+          html += '<span class=\"text-gray-500\">' + entry.time + '</span> '
+          html += '<span class=\"' + color + ' font-bold\">[' + (typeLabel[entry.type] || entry.type) + ']</span> '
+          html += '<span class=\"text-white font-arabic\">' + entry.spoken + '</span>'
+          if (entry.detail) {
+            html += '<br><span class=\"text-gray-400 mr-4 font-arabic\">' + entry.detail + '</span>'
+          }
+          html += '</div>'
+        }
+        el.innerHTML = html || '<div class=\"text-gray-500 text-center py-4 font-arabic\">ابدأ التسميع لرؤية سجل المطابقة</div>'
       }
 
       function pauseSession() {
@@ -2151,13 +2279,21 @@ app.get('/*', (c) => {
         let html = '<div class="max-w-4xl mx-auto px-4 py-3 space-y-3">'
         
         // Listening indicator & interim text
-        if (state.isListening && !state.sessionPaused) {
+        if (!state.sessionPaused) {
           html += '<div class="flex items-center justify-center gap-3">'
-          html += '<div class="listening-indicator w-3 h-3 bg-red-500 rounded-full"></div>'
+          if (state.isListening) {
+            html += '<div class="listening-indicator w-3 h-3 bg-red-500 rounded-full"></div>'
+          } else if (state._isRestarting) {
+            html += '<div class="w-3 h-3 bg-yellow-500 rounded-full animate-pulse"></div>'
+          } else {
+            html += '<div class="w-3 h-3 bg-gray-400 rounded-full"></div>'
+          }
           html += '<span class="font-arabic text-sm text-gray-600 dark:text-gray-400">'
-          if (silenceTime >= 5 && silenceTime < 10) {
+          if (!state.isListening && state._isRestarting) {
+            html += 'إعادة الاتصال...'
+          } else if (silenceTime >= 5 && silenceTime < 15) {
             html += 'جارٍ الاستماع...'
-          } else if (silenceTime >= 10) {
+          } else if (silenceTime >= 15) {
             html += '<span class="text-red-500">صمت طويل - حاول مرة أخرى</span>'
           } else {
             html += 'يستمع...'
@@ -2204,7 +2340,56 @@ app.get('/*', (c) => {
           '<i class="fas fa-eye ml-1"></i>كشف كلمة</button>'
         html += '<button onclick="App.revealCurrentAyah()" class="flex-1 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 font-arabic text-sm py-2.5 px-3 rounded-xl transition-colors">' +
           '<i class="fas fa-eye ml-1"></i>كشف الآية</button>'
+        html += '<button onclick="App.toggleDebugPanel()" class="bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-700 dark:text-gray-300 text-sm py-2.5 px-3 rounded-xl transition-colors" title="سجل التشخيص">' +
+          '<i class="fas fa-bug"></i></button>'
         html += '</div>'
+        
+        // Debug panel
+        if (state.showDebugPanel) {
+          html += '<div class="bg-gray-900 rounded-xl p-3 max-h-48 overflow-y-auto" style="direction:rtl">'
+          html += '<div class="flex items-center justify-between mb-2">'
+          html += '<span class="text-xs text-gray-400 font-arabic font-bold">سجل التطابق (كلمة #' + state.currentWordIndex + ')</span>'
+          html += '<button onclick="App.toggleDebugPanel()" class="text-gray-500 hover:text-gray-300 text-xs">✕</button>'
+          html += '</div>'
+          html += '<div id="debug-panel-content">'
+          // Render existing log entries
+          for (const entry of state.debugLog) {
+            const colors = {
+              'heard': 'text-blue-400',
+              'match': 'text-green-400',
+              'no-match': 'text-red-400',
+              'interim-match': 'text-cyan-400',
+              're-read': 'text-yellow-400',
+              'skip-match': 'text-purple-400',
+              'alt': 'text-orange-400',
+              'system': 'text-gray-400',
+            }
+            const color = colors[entry.type] || 'text-gray-300'
+            const typeLabel = {
+              'heard': '🔊 سمع',
+              'match': '✅ طابق',
+              'no-match': '❌ لم يطابق',
+              'interim-match': '⚡ مؤقت',
+              're-read': '🔁 إعادة',
+              'skip-match': '⏭️ تخطي',
+              'alt': '🔄 بديل',
+              'system': '⚙️ نظام',
+            }
+            html += '<div class=\"text-xs font-mono leading-5 border-b border-gray-700 py-1\">'
+            html += '<span class=\"text-gray-500\">' + entry.time + '</span> '
+            html += '<span class=\"' + color + ' font-bold\">[' + (typeLabel[entry.type] || entry.type) + ']</span> '
+            html += '<span class=\"text-white font-arabic\">' + entry.spoken + '</span>'
+            if (entry.detail) {
+              html += '<br><span class=\"text-gray-400 mr-4 font-arabic\">' + entry.detail + '</span>'
+            }
+            html += '</div>'
+          }
+          if (state.debugLog.length === 0) {
+            html += '<div class=\"text-gray-500 text-center py-4 font-arabic\">ابدأ التسميع لرؤية سجل المطابقة</div>'
+          }
+          html += '</div>'
+          html += '</div>'
+        }
         
         html += '</div>'
         return html
@@ -2906,6 +3091,7 @@ app.get('/*', (c) => {
         endSession,
         revealNextWord,
         revealCurrentAyah,
+        toggleDebugPanel,
         toggleDarkMode,
         setDifficulty,
         completeOnboarding,
