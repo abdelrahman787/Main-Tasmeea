@@ -672,6 +672,10 @@ app.get('/*', (c) => {
             .replace(/\u06E5/g, '')
             // U+06E6 small ya → remove  
             .replace(/\u06E6/g, '')
+            // Quran pause/stop marks (صلى، قلى، مـ، لا، ج، ۛ، ۜ) + surrounding space → remove
+            // These marks (U+06D6-U+06DC) are embedded in word text and are NOT pronounced
+            // NOTE: Use \\s (double backslash) inside template literal so browser receives \s for regex whitespace
+            .replace(/\\s*[\\u06D6-\\u06DC]\\s*/g, '')
             // ءا → آ (hamza + alef = alef madda, ASR outputs آ)
             .replace(/ءا/g, 'آ')
         },
@@ -722,6 +726,7 @@ app.get('/*', (c) => {
           
           // Normal and easy modes
           normalized = this.removeDiacritics(normalized)
+          normalized = normalized.trim()
           normalized = this.normalizeAlif(normalized)
           normalized = this.normalizeYa(normalized)
           
@@ -2936,6 +2941,8 @@ export function runTests() {
         .replace(/\u0656/g, '')
         .replace(/\u06E5/g, '')
         .replace(/\u06E6/g, '')
+        // Quran pause/stop marks (U+06D6-U+06DC) + surrounding whitespace → remove
+        .replace(/\s*[\u06D6-\u06DC]\s*/g, '')
         .replace(/\u0621\u0627/g, '\u0622')
     },
     removeDiacritics(text: string) {
@@ -2964,6 +2971,7 @@ export function runTests() {
         return normalized
       }
       normalized = this.removeDiacritics(normalized)
+      normalized = normalized.trim()
       normalized = this.normalizeAlif(normalized)
       normalized = this.normalizeYa(normalized)
       if (level === 'easy') {
@@ -3110,7 +3118,7 @@ export function runTests() {
   }
 
   let passed = 0
-  const total = 15
+  let total = 15
 
   // ===== Test 1: Multi-word sequence =====
   try {
@@ -3265,6 +3273,54 @@ export function runTests() {
     if (result.match) { console.log('\u2705 PASS: Test 15 - \u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a matched via imlaei (multiple dagger alefs)'); passed++ }
     else { console.error('\u274c FAIL: Test 15 - "\u0627\u0644\u0633\u0645\u0627\u0648\u0627\u062a" should match. Confidence: ' + result.confidence) }
   } catch (e: any) { console.error('\u274c FAIL: Test 15 - ' + e.message) }
+
+  // ========================================
+  // PAUSE MARK TESTS (U+06D6-U+06DC)
+  // ========================================
+  total++
+  try {
+    // U+06DB (three dots ۛ) - رَيْبَ ۛ should match ريب
+    const word16 = { text_uthmani: '\u0631\u064E\u064A\u0652\u0628\u064E \u06DB', text_imlaei: '\u0631\u064E\u064A\u0652\u0628\u064E \u06DB' }
+    const result16 = WordMatcherTest.matchWord('\u0631\u064a\u0628', word16, 'normal')
+    if (result16.match) { console.log('\u2705 PASS: Test 16 - Pause mark \u06DB (three dots) removed from \u0631\u064E\u064A\u0652\u0628\u064E \u06DB'); passed++ }
+    else { console.error('\u274c FAIL: Test 16 - "\u0631\u064a\u0628" should match "\u0631\u064E\u064A\u0652\u0628\u064E \u06DB". Confidence: ' + result16.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 16 - ' + e.message) }
+
+  total++
+  try {
+    // U+06D6 (صلى ۖ) - رَّبِّهِمْ ۖ should match ربهم
+    const word17 = { text_uthmani: '\u0631\u064E\u0651\u0628\u0650\u0651\u0647\u0650\u0645\u0652 \u06D6', text_imlaei: '\u0631\u064E\u0651\u0628\u0650\u0651\u0647\u0650\u0645\u0652 \u06D6' }
+    const result17 = WordMatcherTest.matchWord('\u0631\u0628\u0647\u0645', word17, 'normal')
+    if (result17.match) { console.log('\u2705 PASS: Test 17 - Pause mark \u06D6 (\u0635\u0644\u0649) removed from \u0631\u064E\u0651\u0628\u0650\u0651\u0647\u0650\u0645\u0652 \u06D6'); passed++ }
+    else { console.error('\u274c FAIL: Test 17 - "\u0631\u0628\u0647\u0645" should match. Confidence: ' + result17.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 17 - ' + e.message) }
+
+  total++
+  try {
+    // U+06D7 (قلى ۗ) - ٱلسُّفَهَآءُ ۗ should match السفهاء
+    const word18 = { text_uthmani: '\u0671\u0644\u0633\u064F\u0651\u0641\u064E\u0647\u064E\u0622\u0621\u064F \u06D7', text_imlaei: '\u0627\u0644\u0633\u064F\u0651\u0641\u064E\u0647\u064E\u0627\u0621\u064F \u06D7' }
+    const result18 = WordMatcherTest.matchWord('\u0627\u0644\u0633\u0641\u0647\u0627\u0621', word18, 'normal')
+    if (result18.match) { console.log('\u2705 PASS: Test 18 - Pause mark \u06D7 (\u0642\u0644\u0649) removed from \u0671\u0644\u0633\u064F\u0651\u0641\u064E\u0647\u064E\u0622\u0621\u064F \u06D7'); passed++ }
+    else { console.error('\u274c FAIL: Test 18 - "\u0627\u0644\u0633\u0641\u0647\u0627\u0621" should match. Confidence: ' + result18.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 18 - ' + e.message) }
+
+  total++
+  try {
+    // U+06DA (ج ۚ) - ٱلْمَوْتِ ۚ should match الموت
+    const word19 = { text_uthmani: '\u0671\u0644\u0652\u0645\u064E\u0648\u0652\u062A\u0650 \u06DA', text_imlaei: '\u0627\u0644\u0652\u0645\u064E\u0648\u0652\u062A\u0650 \u06DA' }
+    const result19 = WordMatcherTest.matchWord('\u0627\u0644\u0645\u0648\u062a', word19, 'normal')
+    if (result19.match) { console.log('\u2705 PASS: Test 19 - Pause mark \u06DA (\u062C) removed from \u0671\u0644\u0652\u0645\u064E\u0648\u0652\u062A\u0650 \u06DA'); passed++ }
+    else { console.error('\u274c FAIL: Test 19 - "\u0627\u0644\u0645\u0648\u062a" should match. Confidence: ' + result19.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 19 - ' + e.message) }
+
+  total++
+  try {
+    // Test strict mode also handles pause marks
+    const word20 = { text_uthmani: '\u0631\u064E\u064A\u0652\u0628\u064E \u06DB', text_imlaei: '\u0631\u064E\u064A\u0652\u0628\u064E \u06DB' }
+    const result20 = WordMatcherTest.matchWord('\u0631\u064E\u064A\u0652\u0628\u064E', word20, 'strict')
+    if (result20.match) { console.log('\u2705 PASS: Test 20 - Pause mark removed in STRICT mode too'); passed++ }
+    else { console.error('\u274c FAIL: Test 20 - Strict mode should also remove pause marks. Confidence: ' + result20.confidence) }
+  } catch (e: any) { console.error('\u274c FAIL: Test 20 - ' + e.message) }
 
   console.log('=== \u0646\u062a\u064a\u062c\u0629 \u0627\u0644\u0627\u062e\u062a\u0628\u0627\u0631\u0627\u062a: ' + passed + '/' + total + ' ===')
   return { passed, total }
